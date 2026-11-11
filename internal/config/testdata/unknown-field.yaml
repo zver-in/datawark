@@ -1,0 +1,6 @@
+version: v1alpha1
+server:
+  developmentPrincipal: local-dev
+  unsafeDsn: postgres://reader:secret@example.test/db
+datasources: []
+policies: []

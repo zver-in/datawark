@@ -1,0 +1,25 @@
+version: v1alpha1
+server:
+  developmentPrincipal: local-dev
+datasources:
+  - name: analytics
+    driver: postgres
+    dsnEnv: DATAWARK_ANALYTICS_DSN
+  - name: analytics
+    driver: postgres
+    dsnEnv: DATAWARK_OTHER_DSN
+policies:
+  - name: sales-read
+    principals: [local-dev]
+    datasource: analytics
+    allow:
+      - table: sales.orders
+        operations: [select]
+        columns: [id]
+  - name: sales-read
+    principals: [local-dev]
+    datasource: analytics
+    allow:
+      - table: sales.invoices
+        operations: [select]
+        columns: [id]

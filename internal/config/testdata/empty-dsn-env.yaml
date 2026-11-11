@@ -1,0 +1,8 @@
+version: v1alpha1
+server:
+  developmentPrincipal: local-dev
+datasources:
+  - name: analytics
+    driver: postgres
+    dsnEnv: ""
+policies: []
