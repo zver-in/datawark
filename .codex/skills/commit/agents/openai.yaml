@@ -1,0 +1,3 @@
+interface:
+  display_name: "Commit"
+  short_description: "Create commits with concise English messages"
