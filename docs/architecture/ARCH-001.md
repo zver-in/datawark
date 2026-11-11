@@ -153,7 +153,7 @@ MCP HTTP endpoint: `/mcp`. REST и MCP используют общий `QuerySer
 | Policy Engine | Собственная типизированная модель; CEL/OPA не нужны в MVP |
 | Logging | `log/slog` (JSON) |
 | Metrics / Tracing | Prometheus / OpenTelemetry |
-| Tests | `testing`, `testify`, Go fuzzing, `testcontainers-go` |
+| Tests | `testing`, `testify`, Go fuzzing, Docker Compose для интеграционных тестов |
 | Distribution | Go binary, Docker, Docker Compose |
 
 ## 11. Структура репозитория
@@ -197,7 +197,21 @@ datawark/
 - Политики загружаются при запуске; некорректная конфигурация блокирует старт. Изменение требует перезапуска; hot reload отсутствует.
 - Docker Compose: Gateway + тестовый PostgreSQL; отдельный пример полного стека с Assistant.
 
-## 13. Порядок реализации
+## 13. Стратегия тестирования и CI
+
+В проекте поддерживаются два независимых вида тестов.
+
+| Вид | Расположение и запуск | Граница проверки |
+|---|---|---|
+| Unit | `*_test.go` рядом с проверяемым Go-пакетом; `make test` | Доменная логика, парсинг YAML, policy evaluation, Query Plan и SQL Compiler. Без Docker, сети и настоящей БД. |
+| Integration | `tests/integration/`, build tag `integration`; `make test-integration` | Взаимодействие с реальным PostgreSQL: подключение, introspection, read-only execution, DB grants и защита от SQL injection. Перед запуском команда поднимает изолированную PostgreSQL через `tests/integration/compose.yaml`. |
+
+- Unit-тесты обязательны для новой ветви логики; отрицательные проверки policy и компилятора добавляются рядом с позитивными.
+- Интеграционные тесты не используют внешние БД и не принимают production credentials. Они получают DSN только через `DATAWARK_TEST_POSTGRES_DSN`, который задаёт тестовая команда.
+- Fuzz/property tests для парсера, Query Plan и SQL Compiler выполняются отдельно локально и добавляются в CI по мере появления корпусов.
+- Pull request и изменения в `main` запускают GitHub Actions: проверку форматирования (`gofmt`), `go vet`, unit-тесты с race detector и интеграционные тесты с Docker Compose. Интеграционная job всегда очищает Docker volume после завершения.
+
+## 14. Порядок реализации
 
 1. **M0 — Foundation:** CLI, YAML config, bootstrap, domain types.
 2. **M1 — Security Core:** Policy Engine, Query Plan, Validator, SQL Compiler, unit/fuzz tests.
