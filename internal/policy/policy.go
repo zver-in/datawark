@@ -4,6 +4,7 @@ package policy
 import (
 	"datawark/internal/config"
 	"datawark/internal/query"
+	"errors"
 	"strings"
 )
 
@@ -39,6 +40,27 @@ type Input struct {
 	Principal string
 	Snapshot  *config.Config
 	Plan      query.ValidatedPlan
+}
+
+// AuthorizedQuery is an opaque capability issued only for an allowed policy
+// decision. Its contents are deliberately not constructible by callers.
+type AuthorizedQuery struct {
+	plan query.ValidatedPlan
+}
+
+// Plan returns the validated plan carried by this authorization capability.
+// The boolean is false for the zero value, which is never authorized.
+func (authorized AuthorizedQuery) Plan() (query.ValidatedPlan, bool) {
+	return authorized.plan, authorized.plan.Plan.Source != ""
+}
+
+// Authorize evaluates input and, only on success, issues the capability that
+// downstream compilers require.
+func Authorize(input Input) (AuthorizedQuery, error) {
+	if decision := Evaluate(input); !decision.Allowed {
+		return AuthorizedQuery{}, errors.New("policy: query is not authorized")
+	}
+	return AuthorizedQuery{plan: input.Plan}, nil
 }
 
 // Evaluate authorizes input against exactly its supplied configuration
