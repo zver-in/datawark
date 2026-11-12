@@ -13,9 +13,21 @@ import (
 // Statement is a side-effect-free PostgreSQL statement and its positional
 // arguments. Args are ordered by the placeholders in SQL.
 type Statement struct {
-	SQL  string
-	Args []any
+	sql   string
+	args  []any
+	valid bool
 }
+
+// SQL returns the parameterized SQL text. It is intended for a database
+// adapter, not a transport boundary.
+func (statement Statement) SQL() string { return statement.sql }
+
+// Args returns a copy of the positional arguments in placeholder order.
+func (statement Statement) Args() []any { return append([]any(nil), statement.args...) }
+
+// Valid reports whether this statement was produced by Compile. Its unexported
+// marker prevents callers in other packages from constructing executable SQL.
+func (statement Statement) Valid() bool { return statement.valid }
 
 // Compile renders a single SELECT from a capability issued by policy.Authorize.
 func Compile(authorized policy.AuthorizedQuery) (Statement, error) {
@@ -81,7 +93,7 @@ func compile(plan query.Plan) (Statement, error) {
 
 	args = append(args, plan.Limit)
 	fmt.Fprintf(&sql, " LIMIT $%d", len(args))
-	return Statement{SQL: sql.String(), Args: args}, nil
+	return Statement{sql: sql.String(), args: args, valid: true}, nil
 }
 
 func quoteIdentifier(identifier string) string {

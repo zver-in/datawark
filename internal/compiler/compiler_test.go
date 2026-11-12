@@ -30,11 +30,11 @@ func TestCompileRendersAuthorizedPlanDeterministically(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantSQL := `SELECT "id", "total" FROM "sales"."Orders" WHERE "state" = $1 AND "total" >= $2 ORDER BY "created_at" DESC, "id" ASC LIMIT $3`
-	if got.SQL != wantSQL {
-		t.Fatalf("SQL = %q, want %q", got.SQL, wantSQL)
+	if got.SQL() != wantSQL {
+		t.Fatalf("SQL = %q, want %q", got.SQL(), wantSQL)
 	}
-	if wantArgs := []any{"paid", 42.5, 50}; !reflect.DeepEqual(got.Args, wantArgs) {
-		t.Fatalf("Args = %#v, want %#v", got.Args, wantArgs)
+	if wantArgs := []any{"paid", 42.5, 50}; !reflect.DeepEqual(got.Args(), wantArgs) {
+		t.Fatalf("Args = %#v, want %#v", got.Args(), wantArgs)
 	}
 	again, err := compiler.Compile(authorized)
 	if err != nil || !reflect.DeepEqual(got, again) {
@@ -49,11 +49,11 @@ func TestCompileOmitsOptionalClausesAndQuotesIdentifiers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `SELECT "Select" FROM "Sales"."Order" LIMIT $1`; got.SQL != want {
-		t.Fatalf("SQL = %q, want %q", got.SQL, want)
+	if want := `SELECT "Select" FROM "Sales"."Order" LIMIT $1`; got.SQL() != want {
+		t.Fatalf("SQL = %q, want %q", got.SQL(), want)
 	}
-	if !reflect.DeepEqual(got.Args, []any{1}) {
-		t.Fatalf("Args = %#v, want limit argument", got.Args)
+	if !reflect.DeepEqual(got.Args(), []any{1}) {
+		t.Fatalf("Args = %#v, want limit argument", got.Args())
 	}
 }
 
@@ -66,16 +66,16 @@ func TestCompileBindsHostileValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(got.SQL, hostile) || !strings.Contains(got.SQL, "$1") || strings.Contains(got.SQL, "DROP TABLE") {
-		t.Fatalf("hostile value interpolated into SQL: %q", got.SQL)
+	if strings.Contains(got.SQL(), hostile) || !strings.Contains(got.SQL(), "$1") || strings.Contains(got.SQL(), "DROP TABLE") {
+		t.Fatalf("hostile value interpolated into SQL: %q", got.SQL())
 	}
-	if !reflect.DeepEqual(got.Args, []any{hostile, 5}) {
-		t.Fatalf("Args = %#v, want hostile value and limit", got.Args)
+	if !reflect.DeepEqual(got.Args(), []any{hostile, 5}) {
+		t.Fatalf("Args = %#v, want hostile value and limit", got.Args())
 	}
 }
 
 func TestCompileRejectsUnauthorizedAndInvalidInput(t *testing.T) {
-	if statement, err := compiler.Compile(policy.AuthorizedQuery{}); err == nil || statement.SQL != "" || len(statement.Args) != 0 {
+	if statement, err := compiler.Compile(policy.AuthorizedQuery{}); err == nil || statement.SQL() != "" || len(statement.Args()) != 0 {
 		t.Fatalf("Compile(zero AuthorizedQuery) = %#v, %v; want no SQL and error", statement, err)
 	}
 	invalid := query.Plan{Source: "analytics", Table: "orders", Projection: []string{"id"}, Limit: 1}
@@ -103,7 +103,7 @@ func FuzzCompileDoesNotInterpolateValues(f *testing.F) {
 			t.Fatal(err)
 		}
 		const wantSQL = `SELECT "id" FROM "sales"."orders" WHERE "state" = $1 LIMIT $2`
-		if statement.SQL != wantSQL || !reflect.DeepEqual(statement.Args, []any{value, 1}) {
+		if statement.SQL() != wantSQL || !reflect.DeepEqual(statement.Args(), []any{value, 1}) {
 			t.Fatalf("unsafe statement: %#v", statement)
 		}
 	})
