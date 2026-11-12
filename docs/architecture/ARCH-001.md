@@ -39,11 +39,12 @@ DataWark Assistant (Web + Backend) ─ REST ──┘
 
 ## 3. Режимы запуска Gateway
 
-| Режим | Команда | Назначение |
-|---|---|---|
-| CLI | `datawark config validate`, `datawark policy explain`, `datawark source test` | Локальная конфигурация и диагностика |
-| MCP stdio | `datawark mcp stdio` | Локальные MCP-клиенты; без сетевого listener |
-| HTTP Server | `datawark serve` | REST API и MCP Streamable HTTP на одном listener |
+| Режим | Команда | Назначение | Состояние |
+|---|---|---|---|
+| CLI | `datawark config validate`, `datawark source test` | Локальная конфигурация и диагностика | Реализовано |
+| CLI explain | `datawark policy explain` | Локальный административный dry-run; не блокирует HTTP milestone | Запланировано |
+| MCP stdio | `datawark mcp stdio` | Локальные MCP-клиенты; без сетевого listener | Реализовано |
+| HTTP Server | `datawark serve` | REST API и MCP Streamable HTTP на одном listener | Запланировано |
 
 Административные CLI-команды доступны только доверенному локальному оператору. Удалённый административный API не входит в MVP.
 
@@ -52,7 +53,7 @@ DataWark Assistant (Web + Backend) ─ REST ──┘
 | Компонент | Ответственность |
 |---|---|
 | CLI / REST / MCP adapters | Декодирование запросов и ответы |
-| Identity | Server-configured development principal; будущая проверка credentials |
+| Identity | Server-configured development principal для локального режима; API keys для Public Gateway MVP; OIDC позже |
 | Application Services | Оркестрация запросов, схемы, политик и диагностики |
 | Schema Registry | Снимок метаданных БД и фильтрация видимой клиенту схемы |
 | Query Validator | Проверка структуры, типов, операторов и ресурсов Query Plan |
@@ -66,7 +67,7 @@ CLI, REST и MCP обращаются к **одним Application Services**. П
 ## 5. Путь выполнения запроса
 
 ```text
-Transport → Development Principal
+Transport → Trusted Principal (development principal или API key identity)
           → Runtime Snapshot (policy + schema)
           → Decode / Validate Query Plan
           → Policy Evaluation (allow / deny)
@@ -98,7 +99,7 @@ Transport → Development Principal
 }
 ```
 
-**Разрешено в MVP:** одна таблица, явные колонки, простые типизированные фильтры (AND), сортировка, LIMIT.
+**Разрешено в MVP:** одна таблица, явные колонки, простые типизированные фильтры (AND), сортировка, обязательный положительный LIMIT.
 
 **Не входит в MVP:** произвольный SQL, запись, JOIN, GROUP BY, SQL-функции, подзапросы, агрегаты и произвольные выражения.
 
@@ -117,11 +118,11 @@ Transport → Development Principal
 
 1. LLM и Assistant не получают DB credentials; в начальной версии Gateway использует единственный principal, заданный серверной конфигурацией.
 2. PostgreSQL использует отдельного пользователя с минимальными правами; запросы выполняются в read-only транзакциях.
-3. Resource limits (`statement_timeout`, лимиты строк и размера результата, контроль конкурентности) отложены до следующего этапа.
+3. Resource limits (`statement_timeout`, лимиты строк и размера результата, контроль конкурентности) реализованы и применяются на PostgreSQL execution path.
 4. Неподдерживаемые поля, операторы, типы и ресурсы отклоняются.
 5. Schema API возвращает только разрешённые метаданные.
-6. Audit отложен до следующего этапа; начальная версия не предназначена для production.
-7. В HTTP и MCP stdio используется единственный server-configured development principal; параметры запроса не задают principal или роль.
+6. Public Gateway MVP пишет структурированные JSON audit events. Гарантии формирования и передачи событий внешнему сборщику должны быть определены до реализации; metadata database, внутренняя очередь и transactional outbox в MVP не добавляются.
+7. MCP stdio использует server-configured development principal. HTTP-аутентификация использует API keys; параметры Query Plan не задают principal или роль. OIDC добавляется после MVP.
 8. MCP tools не предоставляют административные операции изменения политик и источников.
 9. При обновлении политики нужна явная семантика для уже выполняющихся запросов; hot reload в MVP необязателен.
 10. Text из базы считается недоверенными данными для Assistant (защита от prompt injection).
@@ -133,10 +134,9 @@ Transport → Development Principal
 | REST | `POST /api/v1/query` | Исполнить Query Plan |
 | REST | `GET /api/v1/schema/...` | Получить разрешённую схему |
 | REST | `POST /api/v1/query/explain` | Проверить план без исполнения |
-| MCP | `datawark_execute_query` | Исполнить Query Plan |
-| MCP | `datawark_describe_schema` | Получить разрешённую схему |
-| MCP | `datawark_list_sources` | Список разрешённых источников |
-| MCP | `datawark_explain_query` | Проверить план без исполнения |
+| MCP | `query_data` | Исполнить Query Plan |
+| MCP | `list_allowed_schema` | Получить разрешённые источники и отфильтрованную схему |
+| MCP | `explain_query` | Проверить план без исполнения |
 
 MCP HTTP endpoint: `/mcp`. REST и MCP используют общий `QueryService` и одинаковые policy decisions. Их Query Plan input schema использует канонические поля `source`, `table`, `projection`, `filters`, `order` и `limit`, соответствующие decoder; точные схемы запросов и ответов фиксируются в OpenAPI и MCP tool schemas.
 
@@ -194,6 +194,7 @@ datawark/
 - YAML-парсер отклоняет неизвестные поля, повторяющиеся имена, пустые обязательные значения и неподдерживаемые операции/драйверы.
 - Для допуска запроса один элемент `allow` обязан целиком покрыть источник, таблицу и все колонки из `projection`, `filters` и `order`; разрешения из разных элементов не объединяются.
 - DSN передаётся через переменные окружения / secrets, не хранится в Git. API keys будут добавлены вместе с HTTP-аутентификацией.
+- Gateway не использует отдельную metadata database: конфигурация и политики загружаются из YAML, а schema snapshots находятся в памяти процесса.
 - Политики загружаются при запуске; некорректная конфигурация блокирует старт. Изменение требует перезапуска; hot reload отсутствует.
 - Docker Compose: Gateway + тестовый PostgreSQL; отдельный пример полного стека с Assistant.
 
@@ -217,9 +218,10 @@ datawark/
 2. **M1 — Security Core:** Policy Engine, Query Plan, Validator, SQL Compiler, unit/fuzz tests.
 3. **M2 — PostgreSQL:** introspection, executor, ограничения, интеграционные тесты.
 4. **M3 — MCP stdio:** локальное использование AI-клиентами.
-5. **M4 — HTTP Gateway:** REST, MCP HTTP, API keys, аудит, observability.
+5. **M4 — HTTP Gateway:** REST, MCP Streamable HTTP, API keys, JSON-аудит и базовая observability; CLI `policy explain` развивается параллельно и не блокирует HTTP.
 6. **M5 — Public MVP:** Docker Compose, quickstart, security regression tests.
-7. **Отдельный релиз Assistant:** Web UI + Go backend + LLM; только через публичный Gateway API.
+7. **M6 — AI Database Assistant:** Web UI + Go backend + LLM; только после Public Gateway MVP и только через публичный Gateway API.
+8. **После M6 — Advanced governance:** OIDC, row-level policies, masking и дополнительные СУБД.
 
 ## 14. Архитектурные инварианты
 
