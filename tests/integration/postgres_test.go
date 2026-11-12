@@ -19,6 +19,7 @@ import (
 	"datawark/internal/execution"
 	pgadapter "datawark/internal/postgres"
 	"datawark/internal/query"
+	gatewayruntime "datawark/internal/runtime"
 	"datawark/internal/schema"
 
 	"github.com/jackc/pgx/v5"
@@ -87,6 +88,35 @@ func TestCatalogSnapshotIncludesUserRelationAndView(t *testing.T) {
 		if !found || len(relation.Columns()) != 2 {
 			t.Fatalf("snapshot missing fixture metadata for %s", name)
 		}
+	}
+}
+
+func TestRuntimeBootstrapIsAllOrNothing(t *testing.T) {
+	dsn := os.Getenv("DATAWARK_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DATAWARK_TEST_POSTGRES_DSN must be set for integration tests")
+	}
+	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "local-dev"}, Datasources: []config.Datasource{
+		{Name: "primary", Driver: "postgres", DSNEnv: "DATAWARK_TEST_POSTGRES_DSN"},
+		{Name: "replica", Driver: "postgres", DSNEnv: "DATAWARK_TEST_POSTGRES_DSN"},
+	}, Policies: []config.Policy{
+		{Name: "primary-read", Principals: []string{"local-dev"}, Datasource: "primary", Allow: []config.AllowEntry{{Table: "public.schema_registry_fixture", Operations: []string{"select"}, Columns: []string{"id"}}}},
+		{Name: "replica-read", Principals: []string{"local-dev"}, Datasource: "replica", Allow: []config.AllowEntry{{Table: "public.schema_registry_fixture", Operations: []string{"select"}, Columns: []string{"id"}}}},
+	}}
+	runtime, err := gatewayruntime.NewFromConfig(context.Background(), configuration, gatewayruntime.Dependencies{})
+	if err != nil || runtime == nil {
+		t.Fatalf("multi-datasource bootstrap = %v, %v", runtime, err)
+	}
+	if got := runtime.Datasources(); len(got) != 2 || got[0] != "primary" || got[1] != "replica" {
+		t.Fatalf("visible datasources = %v", got)
+	}
+
+	t.Setenv("DATAWARK_RUNTIME_UNAVAILABLE_DSN", "postgres://datawark_test:datawark_test@127.0.0.1:1/datawark_test?sslmode=disable")
+	configuration.Datasources = append(configuration.Datasources, config.Datasource{Name: "unavailable", Driver: "postgres", DSNEnv: "DATAWARK_RUNTIME_UNAVAILABLE_DSN"})
+	configuration.Policies = append(configuration.Policies, config.Policy{Name: "unavailable-read", Principals: []string{"local-dev"}, Datasource: "unavailable", Allow: []config.AllowEntry{{Table: "public.schema_registry_fixture", Operations: []string{"select"}, Columns: []string{"id"}}}})
+	runtime, err = gatewayruntime.NewFromConfig(context.Background(), configuration, gatewayruntime.Dependencies{})
+	if runtime != nil || err == nil {
+		t.Fatalf("unavailable datasource exposed runtime=%v err=%v", runtime, err)
 	}
 }
 
