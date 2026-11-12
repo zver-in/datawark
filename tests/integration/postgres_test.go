@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"net/url"
 	"os"
@@ -11,6 +12,10 @@ import (
 	"testing"
 
 	"datawark/internal/cli"
+	"datawark/internal/config"
+	pgadapter "datawark/internal/postgres"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func TestPostgreSQLIsReachable(t *testing.T) {
@@ -46,5 +51,35 @@ func TestSourceTestSucceeds(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exitCode := cli.Execute([]string{"source", "test", "--config", configPath, "--datasource", "test-postgres"}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("source test failed: stderr=%s", stderr.String())
+	}
+}
+
+func TestCatalogSnapshotIncludesUserRelationAndView(t *testing.T) {
+	dsn := os.Getenv("DATAWARK_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DATAWARK_TEST_POSTGRES_DSN must be set for integration tests")
+	}
+	connection, err := pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	if _, err := connection.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS public.schema_registry_fixture (id integer PRIMARY KEY, note text)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.Exec(context.Background(), "CREATE OR REPLACE VIEW public.schema_registry_fixture_view AS SELECT id, note FROM public.schema_registry_fixture"); err != nil {
+		t.Fatal(err)
+	}
+
+	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "local-dev"}, Datasources: []config.Datasource{{Name: "test-postgres", Driver: "postgres", DSNEnv: "DATAWARK_TEST_POSTGRES_DSN"}}, Policies: []config.Policy{{Name: "fixture-read", Principals: []string{"local-dev"}, Datasource: "test-postgres", Allow: []config.AllowEntry{{Table: "public.schema_registry_fixture", Operations: []string{"select"}, Columns: []string{"id"}}}}}}
+	snapshot, err := pgadapter.NewCatalogReader().Load(context.Background(), configuration, "test-postgres")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"public.schema_registry_fixture", "public.schema_registry_fixture_view"} {
+		relation, found := snapshot.Relation(name)
+		if !found || len(relation.Columns()) != 2 {
+			t.Fatalf("snapshot missing fixture metadata for %s", name)
+		}
 	}
 }
