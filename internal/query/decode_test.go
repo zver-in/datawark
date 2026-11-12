@@ -17,6 +17,30 @@ func TestDecodeAcceptsBoundedPlan(t *testing.T) {
 	}
 }
 
+func TestDecodeAcceptsCanonicalPublicFields(t *testing.T) {
+	t.Parallel()
+
+	_, err := Decode([]byte(`{"source":"analytics","table":"reporting.orders","projection":["id"],"order":[{"column":"id","direction":"asc"}],"limit":1}`))
+	if err != nil {
+		t.Fatalf("Decode() returned an error for canonical public fields: %v", err)
+	}
+}
+
+func TestDecodeRejectsLegacyPublicFieldAliases(t *testing.T) {
+	t.Parallel()
+
+	for _, alias := range []string{"select", "columns", "orderBy", "order_by"} {
+		alias := alias
+		t.Run(alias, func(t *testing.T) {
+			t.Parallel()
+			input := []byte(`{"source":"analytics","table":"reporting.orders","projection":["id"],"limit":1,"` + alias + `":[]}`)
+			if _, err := Decode(input); err == nil {
+				t.Fatalf("Decode() accepted legacy alias %q", alias)
+			}
+		})
+	}
+}
+
 func TestDecodeRejectsUnsupportedContentWithoutReflection(t *testing.T) {
 	t.Parallel()
 	secret := "hostile_payload_3241"

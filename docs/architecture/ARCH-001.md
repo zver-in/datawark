@@ -87,11 +87,11 @@ Transport → Development Principal
 {
   "source": "analytics",
   "table": "public.orders",
-  "columns": ["id", "total", "created_at"],
+  "projection": ["id", "total", "created_at"],
   "filters": [
     {"column": "status", "operator": "eq", "value": "paid"}
   ],
-  "order_by": [
+  "order": [
     {"column": "created_at", "direction": "desc"}
   ],
   "limit": 10
@@ -102,7 +102,7 @@ Transport → Development Principal
 
 **Не входит в MVP:** произвольный SQL, запись, JOIN, GROUP BY, SQL-функции, подзапросы, агрегаты и произвольные выражения.
 
-Колонки, используемые в `filters` и `order_by`, тоже проверяются политикой. Идентификаторы берутся из валидированной схемы и безопасно экранируются; значения передаются параметрами.
+Колонки из `projection`, `filters` и `order` тоже проверяются политикой. Идентификаторы берутся из валидированной схемы и безопасно экранируются; значения передаются параметрами. Публичный Query Plan использует только поля `source`, `table`, `projection`, `filters`, `order` и `limit`; алиасы не принимаются. Значение filter — JSON scalar (string, number, boolean или `null`), а `direction` — `asc` или `desc`.
 
 ## 7. Политики доступа
 
@@ -138,7 +138,7 @@ Transport → Development Principal
 | MCP | `datawark_list_sources` | Список разрешённых источников |
 | MCP | `datawark_explain_query` | Проверить план без исполнения |
 
-MCP HTTP endpoint: `/mcp`. REST и MCP используют общий `QueryService` и одинаковые policy decisions. Точные схемы запросов и ответов фиксируются в OpenAPI и MCP tool schemas.
+MCP HTTP endpoint: `/mcp`. REST и MCP используют общий `QueryService` и одинаковые policy decisions. Их Query Plan input schema использует канонические поля `source`, `table`, `projection`, `filters`, `order` и `limit`, соответствующие decoder; точные схемы запросов и ответов фиксируются в OpenAPI и MCP tool schemas.
 
 ## 10. Технологический стек
 
@@ -192,7 +192,7 @@ datawark/
 - Каждый datasource содержит уникальное `name`, `driver: postgres` и `dsnEnv`. `dsnEnv` — имя переменной окружения с DSN PostgreSQL, а не сам DSN.
 - Каждый policy содержит уникальное `name`, непустые `principals`, `datasource` и `allow`. `allow` содержит `table`, `operations: [select]` и разрешённые `columns`.
 - YAML-парсер отклоняет неизвестные поля, повторяющиеся имена, пустые обязательные значения и неподдерживаемые операции/драйверы.
-- Для допуска запроса один элемент `allow` обязан целиком покрыть источник, таблицу и все колонки из `select`, `filters` и `orderBy`; разрешения из разных элементов не объединяются.
+- Для допуска запроса один элемент `allow` обязан целиком покрыть источник, таблицу и все колонки из `projection`, `filters` и `order`; разрешения из разных элементов не объединяются.
 - DSN передаётся через переменные окружения / secrets, не хранится в Git. API keys будут добавлены вместе с HTTP-аутентификацией.
 - Политики загружаются при запуске; некорректная конфигурация блокирует старт. Изменение требует перезапуска; hot reload отсутствует.
 - Docker Compose: Gateway + тестовый PostgreSQL; отдельный пример полного стека с Assistant.
