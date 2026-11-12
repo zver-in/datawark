@@ -7,7 +7,7 @@ Defines the strict, secret-safe configuration contract required to bootstrap a D
 ## Requirements
 
 ### Requirement: Validate a versioned Gateway configuration
-The system SHALL provide `datawark config validate --config <path>` and accept only a YAML document whose version is `v1alpha1` and whose document, mapping, and sequence fields conform to the supported configuration schema.
+The system SHALL provide `datawark config validate --config <path>` and accept only a YAML document whose version is `v1alpha1` and whose document, mapping, and sequence fields conform to the supported configuration schema, including optional `server.runtime` limits.
 
 #### Scenario: Validate a complete supported configuration
 - **WHEN** an operator validates a YAML file with `version: v1alpha1`, server, datasource, and policy values conforming to the supported schema
@@ -20,6 +20,14 @@ The system SHALL provide `datawark config validate --config <path>` and accept o
 #### Scenario: Reject unsupported document version
 - **WHEN** an operator validates a YAML file whose version is absent or differs from `v1alpha1`
 - **THEN** the command exits non-zero and identifies the version field path
+
+#### Scenario: Validate configured runtime limits
+- **WHEN** an operator provides positive `server.runtime.statementTimeout`, `maxRows`, `maxResultBytes`, and `maxConcurrentQueries` values
+- **THEN** validation accepts the configuration and retains each limit
+
+#### Scenario: Reject an invalid runtime limit
+- **WHEN** a runtime limit is non-positive, malformed, or an unknown field
+- **THEN** validation exits non-zero and identifies the runtime field path
 
 ### Requirement: Enforce datasource constraints
 Each datasource SHALL have a non-empty unique name, `driver: postgres`, and a non-empty `dsnEnv` that names the environment variable holding its connection string.
@@ -57,3 +65,10 @@ The configuration format SHALL store only the `dsnEnv` identifier, not a DSN val
 #### Scenario: Report an invalid configuration without leaking a secret
 - **WHEN** validation fails while the process environment contains a PostgreSQL DSN with credentials
 - **THEN** the non-zero command output contains no DSN or password value
+
+### Requirement: Apply compatible runtime limit defaults
+The system SHALL use `5s` statement timeout, 1,000 maximum rows, 4,194,304 maximum result bytes, and 16 maximum concurrent queries when corresponding `server.runtime` fields are absent.
+
+#### Scenario: Use defaults for an existing configuration
+- **WHEN** an operator validates an existing supported configuration without `server.runtime`
+- **THEN** validation succeeds and the runtime configuration contains the documented defaults
