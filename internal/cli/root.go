@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"datawark/internal/config"
+	"datawark/internal/mcpserver"
 	"datawark/internal/postgres"
+	"datawark/internal/runtime"
 	"github.com/spf13/cobra"
 )
 
@@ -22,9 +24,11 @@ type Pinger interface {
 }
 
 type Dependencies struct {
-	Load   Loader
-	Lookup func(string) (string, bool)
-	Pinger Pinger
+	Load    Loader
+	Lookup  func(string) (string, bool)
+	Pinger  Pinger
+	Runtime func(context.Context, string) (*runtime.Runtime, error)
+	RunMCP  func(context.Context, *runtime.Runtime) error
 }
 
 func NewRootCommand(deps Dependencies) *cobra.Command {
@@ -37,10 +41,37 @@ func NewRootCommand(deps Dependencies) *cobra.Command {
 	if deps.Pinger == nil {
 		deps.Pinger = postgres.Connector{}
 	}
+	if deps.Runtime == nil {
+		deps.Runtime = func(ctx context.Context, path string) (*runtime.Runtime, error) {
+			return runtime.New(ctx, path, runtime.Dependencies{})
+		}
+	}
+	if deps.RunMCP == nil {
+		deps.RunMCP = mcpserver.Run
+	}
 
 	root := &cobra.Command{Use: "datawark", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newConfigCommand(deps), newSourceCommand(deps))
+	root.AddCommand(newConfigCommand(deps), newSourceCommand(deps), newMCPCommand(deps))
 	return root
+}
+
+func newMCPCommand(deps Dependencies) *cobra.Command {
+	mcp := &cobra.Command{Use: "mcp"}
+	var path string
+	stdio := &cobra.Command{
+		Use: "stdio",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			runtime, err := deps.Runtime(cmd.Context(), path)
+			if err != nil {
+				return errors.New("MCP runtime bootstrap failed")
+			}
+			return deps.RunMCP(cmd.Context(), runtime)
+		},
+	}
+	stdio.Flags().StringVar(&path, "config", "", "path to configuration YAML")
+	_ = stdio.MarkFlagRequired("config")
+	mcp.AddCommand(stdio)
+	return mcp
 }
 
 func newConfigCommand(deps Dependencies) *cobra.Command {

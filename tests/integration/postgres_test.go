@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,12 +18,14 @@ import (
 	"datawark/internal/compiler"
 	"datawark/internal/config"
 	"datawark/internal/execution"
+	"datawark/internal/mcpserver"
 	pgadapter "datawark/internal/postgres"
 	"datawark/internal/query"
 	gatewayruntime "datawark/internal/runtime"
 	"datawark/internal/schema"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestPostgreSQLIsReachable(t *testing.T) {
@@ -88,6 +91,49 @@ func TestCatalogSnapshotIncludesUserRelationAndView(t *testing.T) {
 		if !found || len(relation.Columns()) != 2 {
 			t.Fatalf("snapshot missing fixture metadata for %s", name)
 		}
+	}
+}
+
+func TestMCPQueryUsesSharedRuntimePipeline(t *testing.T) {
+	dsn := os.Getenv("DATAWARK_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DATAWARK_TEST_POSTGRES_DSN must be set for integration tests")
+	}
+	connection, err := pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	if _, err := connection.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS public.mcp_runtime_fixture (id integer PRIMARY KEY, secret text)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.Exec(context.Background(), "INSERT INTO public.mcp_runtime_fixture (id, secret) VALUES (1, 'hidden') ON CONFLICT (id) DO NOTHING"); err != nil {
+		t.Fatal(err)
+	}
+	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "local-dev"}, Datasources: []config.Datasource{{Name: "test_postgres", Driver: "postgres", DSNEnv: "DATAWARK_TEST_POSTGRES_DSN"}}, Policies: []config.Policy{{Name: "mcp-read", Principals: []string{"local-dev"}, Datasource: "test_postgres", Allow: []config.AllowEntry{{Table: "public.mcp_runtime_fixture", Operations: []string{"select"}, Columns: []string{"id"}}}}}}
+	runtime, err := gatewayruntime.NewFromConfig(context.Background(), configuration, gatewayruntime.Dependencies{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := mcpserver.New(runtime).Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverSession.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "integration", Version: "v1"}, nil)
+	session, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "query_data", Arguments: map[string]any{"source": "test_postgres", "table": "public.mcp_runtime_fixture", "projection": []string{"id"}, "limit": 1}})
+	if err != nil || result.IsError || len(result.Content) != 1 {
+		t.Fatalf("MCP query result=%#v err=%v", result, err)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok || !strings.Contains(text.Text, `"id"`) || strings.Contains(text.Text, "hidden") {
+		t.Fatalf("MCP query content=%#v", result.Content)
 	}
 }
 

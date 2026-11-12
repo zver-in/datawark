@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"datawark/internal/config"
+	"datawark/internal/runtime"
 	"github.com/spf13/cobra"
 )
 
@@ -69,6 +71,54 @@ func TestSourceTestFailuresAreSafe(t *testing.T) {
 	if err == nil || called {
 		t.Fatalf("err=%v called=%v", err, called)
 	}
+}
+
+func TestMCPStdioBootstrapsBeforeServingAndKeepsErrorsOffStdout(t *testing.T) {
+	var started bool
+	command := NewRootCommand(Dependencies{
+		Runtime: func(context.Context, string) (*runtime.Runtime, error) { return &runtime.Runtime{}, nil },
+		RunMCP:  func(context.Context, *runtime.Runtime) error { started = true; return nil },
+	})
+	if output, err := run(command, "mcp", "stdio", "--config", "gateway.yaml"); err != nil || output != "" || !started {
+		t.Fatalf("output=%q err=%v started=%v", output, err, started)
+	}
+
+	started = false
+	command = NewRootCommand(Dependencies{
+		Runtime: func(context.Context, string) (*runtime.Runtime, error) { return nil, errors.New("secret") },
+		RunMCP:  func(context.Context, *runtime.Runtime) error { started = true; return nil },
+	})
+	var stdout, stderr bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	command.SetArgs([]string{"mcp", "stdio", "--config", "gateway.yaml"})
+	if err := command.Execute(); err == nil || started || stdout.Len() != 0 || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("stdout=%q err=%v started=%v", stdout.String(), err, started)
+	}
+}
+
+func TestMCPStdioProcessKeepsDiagnosticsOffStdout(t *testing.T) {
+	command := exec.Command(os.Args[0], "-test.run=TestMCPStdioProcessHelper", "--", "mcp", "stdio", "--config", "missing.yaml")
+	command.Env = append(os.Environ(), "DATAWARK_MCP_HELPER=1")
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Run(); err == nil || stdout.Len() != 0 || !strings.Contains(stderr.String(), "MCP runtime bootstrap failed") {
+		t.Fatalf("stdout=%q stderr=%q err=%v", stdout.String(), stderr.String(), err)
+	}
+}
+
+func TestMCPStdioProcessHelper(t *testing.T) {
+	if os.Getenv("DATAWARK_MCP_HELPER") != "1" {
+		return
+	}
+	arguments := os.Args
+	for index, argument := range arguments {
+		if argument == "--" {
+			os.Exit(Execute(arguments[index+1:], os.Stdout, os.Stderr))
+		}
+	}
+	os.Exit(2)
 }
 
 type pingerFunc func(context.Context, string) error
