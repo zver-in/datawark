@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseFixtures(t *testing.T) {
@@ -40,6 +41,33 @@ func TestParseValidFixture(t *testing.T) {
 	}
 	if cfg.Datasources[0].DSNEnv != "DATAWARK_ANALYTICS_DSN" {
 		t.Fatal("DSN environment name was not decoded")
+	}
+	if got := cfg.Server.RuntimeLimits(); got != DefaultRuntime() {
+		t.Fatalf("runtime defaults = %#v", got)
+	}
+}
+
+func TestParseRuntimeLimits(t *testing.T) {
+	t.Parallel()
+	valid := []byte("version: v1alpha1\nserver:\n  developmentPrincipal: reader\n  runtime:\n    statementTimeout: 250ms\n    maxRows: 2\n    maxResultBytes: 3\n    maxConcurrentQueries: 4\ndatasources:\n  - name: analytics\n    driver: postgres\n    dsnEnv: DATAWARK_ANALYTICS_DSN\npolicies:\n  - name: orders\n    principals: [reader]\n    datasource: analytics\n    allow:\n      - table: public.orders\n        operations: [select]\n        columns: [id]\n")
+	cfg, err := Parse(valid)
+	if err != nil || cfg.Server.Runtime == nil || cfg.Server.Runtime.StatementTimeout != 250*time.Millisecond {
+		t.Fatalf("Parse() = %#v, %v", cfg.Server.Runtime, err)
+	}
+	secret := "postgres://reader:secret@example.test/db"
+	for name, test := range map[string]struct{ old, replacement string }{
+		"zero":      {"maxRows: 2", "maxRows: 0"},
+		"negative":  {"maxResultBytes: 3", "maxResultBytes: -1"},
+		"malformed": {"statementTimeout: 250ms", "statementTimeout: nope"},
+		"unknown":   {"maxRows: 2", "unbounded: " + secret},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := strings.Replace(string(valid), test.old, test.replacement, 1)
+			_, err := Parse([]byte(data))
+			if err == nil || !strings.Contains(err.Error(), "server.runtime") || strings.Contains(err.Error(), secret) {
+				t.Fatalf("unsafe runtime error: %v", err)
+			}
+		})
 	}
 }
 

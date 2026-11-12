@@ -24,6 +24,10 @@ type ErrorCategory string
 const (
 	ErrorUnavailable ErrorCategory = "unavailable"
 	ErrorFailed      ErrorCategory = "failed"
+	ErrorTimeout     ErrorCategory = "timeout"
+	ErrorCapacity    ErrorCategory = "capacity"
+	ErrorRowLimit    ErrorCategory = "row_limit"
+	ErrorResultSize  ErrorCategory = "result_size"
 )
 
 // Error deliberately contains no driver details, SQL, arguments, or DSN.

@@ -9,7 +9,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"datawark/internal/cli"
 	"datawark/internal/compiler"
@@ -148,6 +150,95 @@ func TestQueryServiceRejectsWriteAndDDLShapes(t *testing.T) {
 			t.Fatalf("write shape reached executor: %q", table)
 		}
 	}
+}
+
+func TestPostgresRuntimeGuardrails(t *testing.T) {
+	dsn := os.Getenv("DATAWARK_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DATAWARK_TEST_POSTGRES_DSN must be set for integration tests")
+	}
+	connection, err := pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	for _, sql := range []string{
+		"CREATE TABLE IF NOT EXISTS public.runtime_guard_fixture (id integer PRIMARY KEY, note text)",
+		"TRUNCATE public.runtime_guard_fixture",
+		"INSERT INTO public.runtime_guard_fixture (id, note) VALUES (1, repeat('x', 128))",
+		"CREATE OR REPLACE VIEW public.runtime_guard_sleep AS SELECT id FROM public.runtime_guard_fixture CROSS JOIN LATERAL pg_sleep(0.2)",
+	} {
+		if _, err := connection.Exec(context.Background(), sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan := func(table string, columns []string, limit int) query.Plan {
+		return query.Plan{Source: "test_postgres", Table: table, Projection: columns, Limit: limit}
+	}
+	for name, test := range map[string]struct {
+		runtime config.Runtime
+		plan    query.Plan
+		want    string
+		after   query.Plan
+	}{
+		"timeout": {
+			runtime: config.Runtime{StatementTimeout: 20 * time.Millisecond, MaxRows: 10, MaxResultBytes: 1024, MaxConcurrentQueries: 1},
+			plan:    plan("public.runtime_guard_sleep", []string{"id"}, 1), want: "query execution timeout", after: plan("public.runtime_guard_fixture", []string{"id"}, 1),
+		},
+		"row limit": {
+			runtime: config.Runtime{StatementTimeout: time.Second, MaxRows: 1, MaxResultBytes: 1024, MaxConcurrentQueries: 1},
+			plan:    plan("public.runtime_guard_fixture", []string{"id"}, 2), want: "query execution row_limit", after: plan("public.runtime_guard_fixture", []string{"id"}, 1),
+		},
+		"result size": {
+			runtime: config.Runtime{StatementTimeout: time.Second, MaxRows: 10, MaxResultBytes: 3, MaxConcurrentQueries: 1},
+			plan:    plan("public.runtime_guard_fixture", []string{"note"}, 1), want: "query execution result_size", after: plan("public.runtime_guard_fixture", []string{"id"}, 1),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			service := runtimeService(test.runtime)
+			result, err := service.Execute(context.Background(), test.plan)
+			if err == nil || err.Error() != test.want || len(result.Rows) != 0 {
+				t.Fatalf("guardrail = %#v, %v", result, err)
+			}
+			if result, err := service.Execute(context.Background(), test.after); err != nil || len(result.Rows) != 1 {
+				t.Fatalf("subsequent query = %#v, %v", result, err)
+			}
+		})
+	}
+
+	t.Run("capacity", func(t *testing.T) {
+		service := runtimeService(config.Runtime{StatementTimeout: time.Second, MaxRows: 10, MaxResultBytes: 1024, MaxConcurrentQueries: 1})
+		var once sync.Once
+		started := make(chan struct{})
+		go func() {
+			once.Do(func() { close(started) })
+			_, _ = service.Execute(context.Background(), plan("public.runtime_guard_sleep", []string{"id"}, 1))
+		}()
+		<-started
+		// Give the first request time to enter PostgreSQL and acquire the gate.
+		time.Sleep(25 * time.Millisecond)
+		result, err := service.Execute(context.Background(), plan("public.runtime_guard_fixture", []string{"id"}, 1))
+		if err == nil || err.Error() != "query execution capacity" || len(result.Rows) != 0 {
+			t.Fatalf("capacity = %#v, %v", result, err)
+		}
+		time.Sleep(250 * time.Millisecond)
+		if result, err := service.Execute(context.Background(), plan("public.runtime_guard_fixture", []string{"id"}, 1)); err != nil || len(result.Rows) != 1 {
+			t.Fatalf("subsequent query = %#v, %v", result, err)
+		}
+	})
+}
+
+func runtimeService(runtime config.Runtime) execution.QueryService {
+	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "local-dev", Runtime: &runtime}, Datasources: []config.Datasource{{Name: "test_postgres", Driver: "postgres", DSNEnv: "DATAWARK_TEST_POSTGRES_DSN"}}, Policies: []config.Policy{
+		{Name: "runtime-fixture", Principals: []string{"local-dev"}, Datasource: "test_postgres", Allow: []config.AllowEntry{{Table: "public.runtime_guard_fixture", Operations: []string{"select"}, Columns: []string{"id", "note"}}}},
+		{Name: "runtime-sleep", Principals: []string{"local-dev"}, Datasource: "test_postgres", Allow: []config.AllowEntry{{Table: "public.runtime_guard_sleep", Operations: []string{"select"}, Columns: []string{"id"}}}},
+	}}
+	snapshot := schema.NewSnapshot("test_postgres", []schema.Relation{
+		schema.NewRelation("public", "runtime_guard_fixture", []schema.Column{{Name: "id"}, {Name: "note"}}),
+		schema.NewRelation("public", "runtime_guard_sleep", []schema.Column{{Name: "id"}}),
+	})
+	return execution.QueryService{Configuration: configuration, Snapshot: snapshot, Executor: pgadapter.NewExecutor()}
 }
 
 func readOnlyConfig() config.Config {

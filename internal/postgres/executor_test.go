@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -18,7 +19,7 @@ import (
 
 func TestExecutorRejectsUnavailableDatasourcesAndSanitizesConnectionFailures(t *testing.T) {
 	statement := compiled(t)
-	for name, executor := range map[string]Executor{
+	for name, executor := range map[string]*Executor{
 		"unknown": {LookupEnv: func(string) (string, bool) { return "", false }},
 		"missing": {LookupEnv: func(string) (string, bool) { return "", false }},
 		"connect": {LookupEnv: func(string) (string, bool) { return "postgres://reader:secret@example.test/db", true }, Connect: func(context.Context, string) (ExecutionConnection, error) {
@@ -73,9 +74,77 @@ func TestExecutorRejectsRowCloseFailure(t *testing.T) {
 	}
 }
 
+func TestExecutorEnforcesRuntimeLimits(t *testing.T) {
+	t.Run("row limit before transaction", func(t *testing.T) {
+		connection := &fakeExecutionConnection{transaction: &fakeExecutionTransaction{}}
+		executor := &Executor{LookupEnv: func(string) (string, bool) { return "dsn", true }, Connect: func(context.Context, string) (ExecutionConnection, error) { return connection, nil }}
+		cfg := executorConfig()
+		cfg.Server.Runtime = &config.Runtime{StatementTimeout: time.Second, MaxRows: 0, MaxResultBytes: 100, MaxConcurrentQueries: 1}
+		// A positive runtime is required; compile a plan whose limit is above it.
+		cfg.Server.Runtime.MaxRows = 1
+		statement := compiledLimit(t, 2)
+		_, err := executor.Execute(context.Background(), cfg, "analytics", statement)
+		if err == nil || err.Error() != "query execution row_limit" || connection.begun {
+			t.Fatalf("row limit = %v, begun=%v", err, connection.begun)
+		}
+	})
+	t.Run("result size discards rows", func(t *testing.T) {
+		connection := &fakeExecutionConnection{transaction: &fakeExecutionTransaction{rows: &fakeExecutionRows{fields: []pgconn.FieldDescription{{Name: "note"}}, values: [][]any{{"oversized"}}}}}
+		executor := &Executor{LookupEnv: func(string) (string, bool) { return "dsn", true }, Connect: func(context.Context, string) (ExecutionConnection, error) { return connection, nil }}
+		cfg := runtimeConfig(1, 1, time.Second)
+		_, err := executor.Execute(context.Background(), cfg, "analytics", compiled(t))
+		if err == nil || err.Error() != "query execution result_size" || !connection.transaction.rolledBack {
+			t.Fatalf("result size = %v, transaction=%#v", err, connection.transaction)
+		}
+	})
+}
+
+func TestExecutorRejectsAtCapacityAndReleasesAfterFailure(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	transaction := &fakeExecutionTransaction{rows: &fakeExecutionRows{}, queryFunc: func(context.Context) (ExecutionRows, error) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-release
+		return nil, errors.New("database failure")
+	}}
+	connection := &fakeExecutionConnection{transaction: transaction}
+	executor := &Executor{LookupEnv: func(string) (string, bool) { return "dsn", true }, Connect: func(context.Context, string) (ExecutionConnection, error) { return connection, nil }}
+	cfg := runtimeConfig(100, 1, time.Second)
+	done := make(chan error, 1)
+	go func() { _, err := executor.Execute(context.Background(), cfg, "analytics", compiled(t)); done <- err }()
+	<-started
+	if _, err := executor.Execute(context.Background(), cfg, "analytics", compiled(t)); err == nil || err.Error() != "query execution capacity" || transaction.queries != 1 {
+		t.Fatalf("capacity = %v, queries=%d", err, transaction.queries)
+	}
+	close(release)
+	<-done
+	if _, err := executor.Execute(context.Background(), cfg, "analytics", compiled(t)); err == nil || transaction.queries != 2 {
+		t.Fatalf("released capacity failure = %v, queries=%d", err, transaction.queries)
+	}
+}
+
+func TestExecutorAppliesDeadlineAndCleansUp(t *testing.T) {
+	transaction := &fakeExecutionTransaction{rows: &fakeExecutionRows{}, queryFunc: func(ctx context.Context) (ExecutionRows, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	connection := &fakeExecutionConnection{transaction: transaction}
+	executor := &Executor{LookupEnv: func(string) (string, bool) { return "dsn", true }, Connect: func(context.Context, string) (ExecutionConnection, error) { return connection, nil }}
+	_, err := executor.Execute(context.Background(), runtimeConfig(100, 1, time.Millisecond), "analytics", compiled(t))
+	if err == nil || err.Error() != "query execution timeout" || !transaction.rolledBack || transaction.execs != 1 {
+		t.Fatalf("timeout = %v, transaction=%#v", err, transaction)
+	}
+}
+
 func compiled(t *testing.T) compiler.Statement {
+	return compiledLimit(t, 1)
+}
+func compiledLimit(t *testing.T, limit int) compiler.Statement {
 	t.Helper()
-	plan, err := query.Validate(query.Plan{Source: "analytics", Table: "public.orders", Projection: []string{"id"}, Limit: 1})
+	plan, err := query.Validate(query.Plan{Source: "analytics", Table: "public.orders", Projection: []string{"id"}, Limit: limit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +157,11 @@ func compiled(t *testing.T) compiler.Statement {
 		t.Fatal(err)
 	}
 	return statement
+}
+func runtimeConfig(maxBytes, maxConcurrent int, timeout time.Duration) config.Config {
+	cfg := executorConfig()
+	cfg.Server.Runtime = &config.Runtime{StatementTimeout: timeout, MaxRows: 100, MaxResultBytes: maxBytes, MaxConcurrentQueries: maxConcurrent}
+	return cfg
 }
 func executorConfig() config.Config {
 	return config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "reader"}, Datasources: []config.Datasource{{Name: "analytics", Driver: "postgres", DSNEnv: "TEST_DSN"}}, Policies: []config.Policy{{Name: "orders", Principals: []string{"reader"}, Datasource: "analytics", Allow: []config.AllowEntry{{Table: "public.orders", Operations: []string{"select"}, Columns: []string{"id"}}}}}}
@@ -112,11 +186,20 @@ type fakeExecutionTransaction struct {
 	queries    int
 	committed  bool
 	rolledBack bool
+	execs      int
+	queryFunc  func(context.Context) (ExecutionRows, error)
 }
 
-func (transaction *fakeExecutionTransaction) Query(context.Context, string, ...any) (ExecutionRows, error) {
+func (transaction *fakeExecutionTransaction) Query(ctx context.Context, _ string, _ ...any) (ExecutionRows, error) {
 	transaction.queries++
+	if transaction.queryFunc != nil {
+		return transaction.queryFunc(ctx)
+	}
 	return transaction.rows, nil
+}
+func (transaction *fakeExecutionTransaction) Exec(context.Context, string, ...any) error {
+	transaction.execs++
+	return nil
 }
 func (transaction *fakeExecutionTransaction) Commit(context.Context) error {
 	transaction.committed = true

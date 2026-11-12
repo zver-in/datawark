@@ -2,6 +2,11 @@ version: v1alpha1
 
 server:
   developmentPrincipal: local-dev
+  runtime:
+    statementTimeout: 5s
+    maxRows: 1000
+    maxResultBytes: 4194304
+    maxConcurrentQueries: 16
 
 datasources:
   - name: analytics

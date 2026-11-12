@@ -8,11 +8,19 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
 
 const VersionV1Alpha1 = "v1alpha1"
+
+const (
+	DefaultStatementTimeout     = 5 * time.Second
+	DefaultMaxRows              = 1000
+	DefaultMaxResultBytes       = 4 * 1024 * 1024
+	DefaultMaxConcurrentQueries = 16
+)
 
 type Config struct {
 	Version     string       `yaml:"version"`
@@ -22,7 +30,26 @@ type Config struct {
 }
 
 type Server struct {
-	DevelopmentPrincipal string `yaml:"developmentPrincipal"`
+	DevelopmentPrincipal string   `yaml:"developmentPrincipal"`
+	Runtime              *Runtime `yaml:"runtime"`
+}
+
+type Runtime struct {
+	StatementTimeout     time.Duration `yaml:"statementTimeout"`
+	MaxRows              int           `yaml:"maxRows"`
+	MaxResultBytes       int           `yaml:"maxResultBytes"`
+	MaxConcurrentQueries int           `yaml:"maxConcurrentQueries"`
+}
+
+func DefaultRuntime() Runtime {
+	return Runtime{DefaultStatementTimeout, DefaultMaxRows, DefaultMaxResultBytes, DefaultMaxConcurrentQueries}
+}
+
+func (server Server) RuntimeLimits() Runtime {
+	if server.Runtime == nil {
+		return DefaultRuntime()
+	}
+	return *server.Runtime
 }
 
 type Datasource struct {
@@ -85,6 +112,9 @@ func Parse(data []byte) (Config, error) {
 	if violation := unknownFieldViolation(&document); violation != nil {
 		return Config{}, &ValidationError{Violations: []Violation{*violation}}
 	}
+	if violation := runtimeSyntaxViolation(&document); violation != nil {
+		return Config{}, &ValidationError{Violations: []Violation{*violation}}
+	}
 	var cfg Config
 	if err := document.Decode(&cfg); err != nil {
 		return Config{}, errors.New("configuration: invalid YAML document")
@@ -92,7 +122,35 @@ func Parse(data []byte) (Config, error) {
 	if err := Validate(cfg); err != nil {
 		return Config{}, err
 	}
+	if cfg.Server.Runtime == nil {
+		defaults := DefaultRuntime()
+		cfg.Server.Runtime = &defaults
+	}
 	return cfg, nil
+}
+
+func runtimeSyntaxViolation(document *yaml.Node) *Violation {
+	root := document.Content[0]
+	for i := 0; i < len(root.Content); i += 2 {
+		if root.Content[i].Value != "server" || root.Content[i+1].Kind != yaml.MappingNode {
+			continue
+		}
+		server := root.Content[i+1]
+		for j := 0; j < len(server.Content); j += 2 {
+			if server.Content[j].Value != "runtime" || server.Content[j+1].Kind != yaml.MappingNode {
+				continue
+			}
+			runtime := server.Content[j+1]
+			for k := 0; k < len(runtime.Content); k += 2 {
+				if runtime.Content[k].Value == "statementTimeout" {
+					if _, err := time.ParseDuration(runtime.Content[k+1].Value); err != nil {
+						return &Violation{Path: "server.runtime.statementTimeout", Message: "must be a duration"}
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func unknownFieldViolation(document *yaml.Node) *Violation {
@@ -101,7 +159,8 @@ func unknownFieldViolation(document *yaml.Node) *Violation {
 	}
 	return checkMapping(document.Content[0], "", map[string]map[string]struct{}{
 		"":                   fieldSet("version", "server", "datasources", "policies"),
-		"server":             fieldSet("developmentPrincipal"),
+		"server":             fieldSet("developmentPrincipal", "runtime"),
+		"server.runtime":     fieldSet("statementTimeout", "maxRows", "maxResultBytes", "maxConcurrentQueries"),
 		"datasources[]":      fieldSet("name", "driver", "dsnEnv"),
 		"policies[]":         fieldSet("name", "principals", "datasource", "allow"),
 		"policies[].allow[]": fieldSet("table", "operations", "columns"),
@@ -129,7 +188,7 @@ func checkMapping(node *yaml.Node, path string, allowed map[string]map[string]st
 		}
 		childPath := joinPath(path, field)
 		switch childPath {
-		case "server":
+		case "server", "server.runtime":
 			if violation := checkMapping(value, childPath, allowed); violation != nil {
 				return violation
 			}
@@ -186,6 +245,20 @@ func Validate(cfg Config) error {
 	}
 	if strings.TrimSpace(cfg.Server.DevelopmentPrincipal) == "" {
 		add("server.developmentPrincipal", "is required")
+	}
+	if runtime := cfg.Server.Runtime; runtime != nil {
+		if runtime.StatementTimeout <= 0 {
+			add("server.runtime.statementTimeout", "must be positive")
+		}
+		if runtime.MaxRows <= 0 {
+			add("server.runtime.maxRows", "must be positive")
+		}
+		if runtime.MaxResultBytes <= 0 {
+			add("server.runtime.maxResultBytes", "must be positive")
+		}
+		if runtime.MaxConcurrentQueries <= 0 {
+			add("server.runtime.maxConcurrentQueries", "must be positive")
+		}
 	}
 
 	datasources := make(map[string]struct{}, len(cfg.Datasources))
