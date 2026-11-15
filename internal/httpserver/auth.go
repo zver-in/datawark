@@ -12,6 +12,7 @@ import (
 	"datawark/internal/audit"
 	"datawark/internal/config"
 	"datawark/internal/principal"
+	"datawark/internal/telemetry"
 )
 
 type principalContextKey struct{}
@@ -106,6 +107,7 @@ func (authenticator *Authenticator) Authenticate(headers http.Header) (principal
 func (authenticator *Authenticator) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if operationalPath(request.URL.Path) {
+			telemetry.SetAuthentication(request.Context(), "not_applicable")
 			next.ServeHTTP(writer, request)
 			return
 		}
@@ -113,6 +115,7 @@ func (authenticator *Authenticator) middleware(next http.Handler) http.Handler {
 		identity, ok := authenticator.Authenticate(request.Header)
 		event := audit.Event{Version: audit.VersionV1Alpha1, Timestamp: started.UTC(), RequestID: RequestID(request.Context()), Transport: authenticationTransport(request.URL.Path), Operation: audit.OperationAuthenticate, DurationMS: time.Since(started).Milliseconds()}
 		if !ok {
+			telemetry.SetAuthentication(request.Context(), "unauthenticated")
 			event.Outcome, event.Reason = audit.OutcomeDenied, audit.ReasonAuthentication
 			if !authenticator.record(event) {
 				unavailable(writer, request)
@@ -122,6 +125,7 @@ func (authenticator *Authenticator) middleware(next http.Handler) http.Handler {
 			return
 		}
 		event.Principal, event.Outcome, event.Reason = identity.Name(), audit.OutcomeSuccess, audit.ReasonNone
+		telemetry.SetAuthentication(request.Context(), "authenticated")
 		if !authenticator.record(event) {
 			unavailable(writer, request)
 			return

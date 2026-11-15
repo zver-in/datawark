@@ -9,6 +9,7 @@ import (
 	"datawark/internal/policy"
 	"datawark/internal/query"
 	"datawark/internal/runtime"
+	"datawark/internal/telemetry"
 	"encoding/json"
 	"errors"
 	"io"
@@ -170,9 +171,33 @@ func (gateway *AuditedGateway) listAllowedSchema(ctx context.Context) (result sc
 	return result, err
 }
 
-func (gateway *AuditedGateway) record(_ context.Context, operation audit.Operation, run func() error) error {
+func (gateway *AuditedGateway) record(ctx context.Context, operation audit.Operation, run func() error) error {
 	started := time.Now()
 	err := run()
+	telemetry.SetOperation(ctx, string(operation))
+	if err == nil {
+		telemetry.SetPolicy(ctx, "allowed")
+		telemetry.SetExecution(ctx, "success")
+	} else if strings.HasPrefix(err.Error(), "policy:") {
+		telemetry.SetPolicy(ctx, "denied")
+		telemetry.SetExecution(ctx, "not_applicable")
+	} else {
+		var executionError execution.Error
+		switch {
+		case errors.As(err, &executionError) && executionError.Category == execution.ErrorTimeout:
+			telemetry.SetExecution(ctx, "timeout")
+		case errors.As(err, &executionError) && executionError.Category == execution.ErrorCapacity:
+			telemetry.SetExecution(ctx, "capacity")
+		case errors.As(err, &executionError) && executionError.Category == execution.ErrorRowLimit:
+			telemetry.SetExecution(ctx, "row_limit")
+		case errors.As(err, &executionError) && executionError.Category == execution.ErrorResultSize:
+			telemetry.SetExecution(ctx, "result_size")
+		case errors.As(err, &executionError) && executionError.Category == execution.ErrorUnavailable, strings.HasPrefix(err.Error(), "runtime:"):
+			telemetry.SetExecution(ctx, "unavailable")
+		default:
+			telemetry.SetExecution(ctx, "internal")
+		}
+	}
 	outcome, reason := audit.Classify(err)
 	event := audit.Event{Version: audit.VersionV1Alpha1, Timestamp: started.UTC(), RequestID: gateway.requestID, Transport: audit.TransportMCPHTTP, Operation: operation, Principal: gateway.principal, Outcome: outcome, Reason: reason, DurationMS: time.Since(started).Milliseconds()}
 	if gateway.recorder != nil && gateway.recorder.Record(event) != nil {

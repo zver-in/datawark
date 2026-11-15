@@ -14,6 +14,7 @@ import (
 	"datawark/internal/principal"
 	"datawark/internal/query"
 	"datawark/internal/schema"
+	"datawark/internal/telemetry"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -122,6 +123,7 @@ func (api *restAPI) planOperation(writer http.ResponseWriter, request *http.Requ
 		response, err = call(gateway, plan.Plan)
 		return err
 	})
+	annotateOutcome(request.Context(), err)
 	if err != nil {
 		writeMappedError(writer, request, err)
 		return
@@ -150,6 +152,7 @@ func (api *restAPI) schemaList(writer http.ResponseWriter, request *http.Request
 		}
 		return nil
 	})
+	annotateOutcome(request.Context(), err)
 	if err != nil {
 		writeMappedError(writer, request, err)
 		return
@@ -187,6 +190,7 @@ func (api *restAPI) schemaGet(writer http.ResponseWriter, request *http.Request)
 		response = snapshotDTO(snapshot)
 		return nil
 	})
+	annotateOutcome(request.Context(), err)
 	if err != nil {
 		writeMappedError(writer, request, err)
 		return
@@ -255,6 +259,43 @@ func writeMappedError(writer http.ResponseWriter, request *http.Request, err err
 	default:
 		writeError(writer, request, http.StatusInternalServerError, "internal", "internal server error")
 	}
+}
+
+func annotateOutcome(ctx context.Context, err error) {
+	if err == nil {
+		telemetry.SetPolicy(ctx, "allowed")
+		telemetry.SetExecution(ctx, "success")
+		return
+	}
+	if strings.HasPrefix(err.Error(), "policy:") {
+		telemetry.SetPolicy(ctx, "denied")
+		telemetry.SetExecution(ctx, "not_applicable")
+		return
+	}
+	var executionError execution.Error
+	if errors.As(err, &executionError) {
+		telemetry.SetPolicy(ctx, "allowed")
+		switch executionError.Category {
+		case execution.ErrorTimeout:
+			telemetry.SetExecution(ctx, "timeout")
+		case execution.ErrorCapacity:
+			telemetry.SetExecution(ctx, "capacity")
+		case execution.ErrorRowLimit:
+			telemetry.SetExecution(ctx, "row_limit")
+		case execution.ErrorResultSize:
+			telemetry.SetExecution(ctx, "result_size")
+		case execution.ErrorUnavailable:
+			telemetry.SetExecution(ctx, "unavailable")
+		default:
+			telemetry.SetExecution(ctx, "internal")
+		}
+		return
+	}
+	if strings.HasPrefix(err.Error(), "runtime:") || errors.Is(err, ErrAuditUnavailable) {
+		telemetry.SetExecution(ctx, "unavailable")
+		return
+	}
+	telemetry.SetExecution(ctx, "internal")
 }
 
 func writeError(writer http.ResponseWriter, request *http.Request, status int, code, message string) {

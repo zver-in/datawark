@@ -13,8 +13,11 @@ import (
 
 	"datawark/internal/audit"
 	"datawark/internal/mcpserver"
+	"datawark/internal/telemetry"
 	"github.com/go-chi/chi/v5"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -36,8 +39,15 @@ func RequestID(ctx context.Context) string {
 
 // Server owns one HTTP server and its readiness state.
 type Server struct {
-	server *http.Server
-	ready  atomic.Bool
+	server   *http.Server
+	ready    atomic.Bool
+	logger   *slog.Logger
+	metrics  requestMetrics
+	registry *prometheus.Registry
+}
+
+type requestMetrics interface {
+	Record(context.Context, int, time.Duration) error
 }
 
 func New(address string, authenticators ...*Authenticator) *Server {
@@ -54,18 +64,21 @@ func NewWithGateway(address string, authenticator *Authenticator, bind GatewayBi
 }
 
 func newServer(address string, bind GatewayBinder, recorder audit.Recorder, authenticators ...*Authenticator) *Server {
-	service := &Server{}
+	metrics := telemetry.NewMetrics()
+	service := &Server{logger: telemetry.NewLogger(), metrics: metrics, registry: metrics.Registry}
 	router := chi.NewRouter()
 	router.Get("/api/v1/health", service.health)
 	router.Get("/api/v1/ready", service.readiness)
+	router.Handle("/metrics", promhttp.HandlerFor(service.registry, promhttp.HandlerOpts{}))
 	if bind != nil {
 		newRESTAPI(bind, recorder).routes(router)
-		router.Handle("/mcp", mcpHTTPHandler(bind, recorder))
+		router.Handle("/mcp", mcpHTTPHandler(bind, recorder, service.logger))
 	}
 	var handler http.Handler = router
 	if len(authenticators) == 1 && authenticators[0] != nil {
 		handler = authenticators[0].middleware(handler)
 	}
+	handler = service.observe(handler)
 	handler = service.requestID(handler)
 	service.server = &http.Server{
 		Addr:              address,
@@ -78,8 +91,8 @@ func newServer(address string, bind GatewayBinder, recorder audit.Recorder, auth
 	return service
 }
 
-func mcpHTTPHandler(bind GatewayBinder, recorder audit.Recorder) http.Handler {
-	logger := slog.New(safeMCPLogHandler{base: slog.Default().Handler()})
+func mcpHTTPHandler(bind GatewayBinder, recorder audit.Recorder, operationalLogger *slog.Logger) http.Handler {
+	logger := slog.New(safeMCPLogHandler{base: operationalLogger.Handler()})
 	return mcp.NewStreamableHTTPHandler(func(request *http.Request) *mcp.Server {
 		identity, ok := Principal(request.Context())
 		if !ok || bind == nil {
@@ -114,6 +127,7 @@ func (service *Server) Handler() http.Handler { return service.server.Handler }
 // Serve begins processing only after the caller has completed runtime bootstrap.
 func (service *Server) Serve(listener net.Listener) error {
 	service.ready.Store(true)
+	service.logger.Info("http server started", "event", "startup")
 	err := service.server.Serve(listener)
 	if err == http.ErrServerClosed {
 		return nil
@@ -124,10 +138,12 @@ func (service *Server) Serve(listener net.Listener) error {
 // Shutdown first withdraws readiness, then bounds graceful in-flight completion.
 func (service *Server) Shutdown(ctx context.Context) error {
 	service.ready.Store(false)
+	service.logger.Info("http server readiness withdrawn", "event", "readiness_withdrawn")
 	if err := service.server.Shutdown(ctx); err != nil {
 		_ = service.server.Close()
 		return err
 	}
+	service.logger.Info("http server stopped", "event", "shutdown")
 	return nil
 }
 
@@ -150,7 +166,65 @@ func (service *Server) requestID(next http.Handler) http.Handler {
 			id = newRequestID()
 		}
 		writer.Header().Set(RequestIDHeader, id)
-		next.ServeHTTP(writer, request.WithContext(context.WithValue(request.Context(), requestIDContextKey{}, id)))
+		transport, operation := requestTelemetry(request.URL.Path)
+		ctx := context.WithValue(request.Context(), requestIDContextKey{}, id)
+		next.ServeHTTP(writer, request.WithContext(telemetry.WithRequest(ctx, transport, operation)))
+	})
+}
+
+func requestTelemetry(path string) (string, string) {
+	switch path {
+	case "/api/v1/query":
+		return telemetry.TransportREST, "query"
+	case "/api/v1/query/explain":
+		return telemetry.TransportREST, "explain"
+	case "/api/v1/schema":
+		return telemetry.TransportREST, "schema_list"
+	case "/mcp":
+		return telemetry.TransportMCP, "mcp"
+	case "/metrics":
+		return telemetry.TransportOps, "metrics"
+	case "/api/v1/health":
+		return telemetry.TransportOps, "health"
+	case "/api/v1/ready":
+		return telemetry.TransportOps, "ready"
+	default:
+		return telemetry.Other, telemetry.Other
+	}
+}
+
+type responseCapture struct {
+	http.ResponseWriter
+	status, bytes int
+}
+
+func (writer *responseCapture) WriteHeader(status int) {
+	if writer.status == 0 {
+		writer.status = status
+	}
+	writer.ResponseWriter.WriteHeader(status)
+}
+func (writer *responseCapture) Write(data []byte) (int, error) {
+	if writer.status == 0 {
+		writer.WriteHeader(http.StatusOK)
+	}
+	n, err := writer.ResponseWriter.Write(data)
+	writer.bytes += n
+	return n, err
+}
+
+func (service *Server) observe(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		started := time.Now()
+		captured := &responseCapture{ResponseWriter: writer}
+		next.ServeHTTP(captured, request)
+		if captured.status == 0 {
+			captured.status = http.StatusOK
+		}
+		elapsed := time.Since(started)
+		_ = service.metrics.Record(request.Context(), captured.status, elapsed)
+		transport, operation, auth, policy, execution := telemetry.Snapshot(request.Context())
+		service.logger.Info("http request complete", "request_id", RequestID(request.Context()), "transport", transport, "operation", operation, "authentication", auth, "policy", policy, "execution", execution, "status_class", telemetry.StatusClass(captured.status), "status", captured.status, "bytes", captured.bytes, "duration_ms", elapsed.Milliseconds())
 	})
 }
 
