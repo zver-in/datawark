@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"datawark/internal/audit"
+	"datawark/internal/config"
 	"datawark/internal/execution"
 	"datawark/internal/policy"
 	"datawark/internal/principal"
@@ -204,4 +205,38 @@ func TestRESTOperationAuditPrecedesResponseAndFailsClosed(t *testing.T) {
 			t.Fatalf("status=%d calls=%d", response.Code, test.recorder.calls)
 		}
 	}
+}
+
+func TestRESTRequestEmitsAuthenticationAndOperationEvents(t *testing.T) {
+	authenticator, err := NewAuthenticator([]config.APIKey{{Principal: "reader", KeyEnv: "READER_KEY"}}, func(string) (string, bool) { return "reader-key", true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &eventRecorder{}
+	authenticator.SetRecorder(recorder)
+	handler := NewWithGateway("", authenticator, func(principal.Trusted) (Gateway, error) {
+		return &restGateway{executeResult: execution.Result{Columns: []string{"id"}}}, nil
+	}).Handler()
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/query", strings.NewReader(`{"source":"analytics","table":"public.events","projection":["id"],"filters":[],"order":[],"limit":1}`))
+	request.Header.Set("Authorization", "Bearer reader-key")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(RequestIDHeader, "correlated-1")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || len(recorder.events) != 2 {
+		t.Fatalf("status=%d events=%#v", response.Code, recorder.events)
+	}
+	if recorder.events[0].Operation != audit.OperationAuthenticate || recorder.events[1].Operation != audit.OperationQuery || recorder.events[0].RequestID != "correlated-1" || recorder.events[1].RequestID != "correlated-1" {
+		t.Fatalf("events=%#v", recorder.events)
+	}
+}
+
+type eventRecorder struct {
+	events []audit.Event
+	err    error
+}
+
+func (recorder *eventRecorder) Record(event audit.Event) error {
+	recorder.events = append(recorder.events, event)
+	return recorder.err
 }

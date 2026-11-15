@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -173,6 +175,51 @@ func TestServeIntegrationBootstrapsBeforeBindingAndShutsDown(t *testing.T) {
 	}
 }
 
+func TestServeWritesAuditEventsOnlyToStdout(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	command := NewRootCommand(Dependencies{
+		Bootstrap: func(context.Context, string) (*runtime.Runtime, config.Config, error) {
+			return mcpRuntime(t), config.Config{Server: config.Server{HTTP: &config.HTTP{ListenAddress: listener.Addr().String(), APIKeys: []config.APIKey{{Principal: "local-dev", KeyEnv: "KEY"}}}}}, nil
+		},
+		Lookup: func(string) (string, bool) { return "key", true },
+		Listen: func(string, string) (net.Listener, error) { return listener, nil },
+	})
+	var stdout, stderr bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	command.SetContext(ctx)
+	command.SetArgs([]string{"serve", "--config", "gateway.yaml"})
+	done := make(chan error, 1)
+	go func() { done <- command.Execute() }()
+	endpoint := "http://" + listener.Addr().String()
+	deadline := time.Now().Add(time.Second)
+	for {
+		request, _ := http.NewRequest(http.MethodGet, endpoint+"/unknown", nil)
+		request.Header.Set("Authorization", "Bearer key")
+		response, requestErr := http.DefaultClient.Do(request)
+		if requestErr == nil {
+			response.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(requestErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), `"operation":"authenticate"`) || stderr.Len() != 0 {
+		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
 type mcpCatalog struct{}
 
 func (mcpCatalog) Load(context.Context, config.Config, string) (schema.Snapshot, error) {
@@ -201,6 +248,13 @@ func TestMCPStdioProcessKeepsDiagnosticsOffStdout(t *testing.T) {
 }
 
 func TestMCPStdioProcessHelper(t *testing.T) {
+	if os.Getenv("DATAWARK_MCP_PROTOCOL_HELPER") == "1" {
+		command := NewRootCommand(Dependencies{Runtime: func(context.Context, string) (*runtime.Runtime, error) { return mcpRuntime(t), nil }})
+		command.SetArgs([]string{"mcp", "stdio", "--config", "gateway.yaml"})
+		command.SetOut(os.Stdout)
+		command.SetErr(os.Stderr)
+		os.Exit(boolExit(command.Execute()))
+	}
 	if os.Getenv("DATAWARK_MCP_HELPER") != "1" {
 		return
 	}
@@ -211,6 +265,55 @@ func TestMCPStdioProcessHelper(t *testing.T) {
 		}
 	}
 	os.Exit(2)
+}
+
+func boolExit(err error) int {
+	if err != nil {
+		return 1
+	}
+	return 0
+}
+
+func TestMCPStdioProcessEmitsOnlyProtocolMessages(t *testing.T) {
+	command := exec.Command(os.Args[0], "-test.run=TestMCPStdioProcessHelper", "--")
+	command.Env = append(os.Environ(), "DATAWARK_MCP_PROTOCOL_HELPER=1")
+	input, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(output)
+	send := func(message any) { data, _ := json.Marshal(message); _, _ = input.Write(append(data, '\n')) }
+	receive := func() string {
+		if !scanner.Scan() {
+			t.Fatalf("stdout ended: %s", stderr.String())
+		}
+		return scanner.Text()
+	}
+	send(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "test", "version": "1"}}})
+	first := receive()
+	send(map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{}})
+	send(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": map[string]any{"name": "query_data", "arguments": map[string]any{"source": "analytics", "table": "bad", "projection": []string{"id"}, "limit": 1}}})
+	second := receive()
+	_ = input.Close()
+	_ = command.Wait()
+	for _, line := range []string{first, second} {
+		var message map[string]any
+		if json.Unmarshal([]byte(line), &message) != nil || message["jsonrpc"] != "2.0" {
+			t.Fatalf("stdout=%q", line)
+		}
+	}
+	if strings.Contains(first+second, `"version":"v1alpha1"`) || stderr.Len() != 0 {
+		t.Fatalf("stdout=%q stderr=%q", first+second, stderr.String())
+	}
 }
 
 type pingerFunc func(context.Context, string) error

@@ -14,9 +14,9 @@
 
 ## 3. Process integration
 
-- [ ] 3.1 Wire `datawark serve` to a stdout JSON-lines audit recorder while keeping operational diagnostics on stderr; verify process tests separate both streams.
-- [ ] 3.2 Prove MCP stdio remains outside the HTTP audit boundary; verify its stdout contains only MCP protocol output under successful and failing tool calls.
-- [ ] 3.3 Add HTTP integration tests for authentication and fake data operations, writer failure, and request correlation; verify `go test ./...` passes with one authentication event plus one operation event for an accepted request.
+- [x] 3.1 Wire `datawark serve` to a stdout JSON-lines audit recorder while keeping operational diagnostics on stderr; verify process tests separate both streams.
+- [x] 3.2 Prove MCP stdio remains outside the HTTP audit boundary; verify its stdout contains only MCP protocol output under successful and failing tool calls.
+- [x] 3.3 Add HTTP integration tests for authentication and fake data operations, writer failure, and request correlation; verify `go test ./...` passes with one authentication event plus one operation event for an accepted request.
 
 ## Workflow follow-up
 
