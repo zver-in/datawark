@@ -268,7 +268,7 @@ func TestPostgresRuntimeGuardrails(t *testing.T) {
 		after   query.Plan
 	}{
 		"timeout": {
-			runtime: config.Runtime{StatementTimeout: 20 * time.Millisecond, MaxRows: 10, MaxResultBytes: 1024, MaxConcurrentQueries: 1},
+			runtime: config.Runtime{StatementTimeout: 100 * time.Millisecond, MaxRows: 10, MaxResultBytes: 1024, MaxConcurrentQueries: 1},
 			plan:    plan("public.runtime_guard_sleep", []string{"id"}, 1), want: "query execution timeout", after: plan("public.runtime_guard_fixture", []string{"id"}, 1),
 		},
 		"row limit": {

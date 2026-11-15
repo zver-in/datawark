@@ -108,11 +108,19 @@ func TestRuntimeOperationsNeverExecuteRejectedPlans(t *testing.T) {
 	if executor.calls != 0 {
 		t.Fatalf("executor calls = %d", executor.calls)
 	}
-	if explanation := local.Explain(query.Plan{Source: "primary", Table: "public.orders", Projection: []string{"id"}, Limit: 1}); !explanation.Allowed {
-		t.Fatalf("explanation = %#v", explanation)
-	}
-	if explanation := local.Explain(query.Plan{Source: "primary", Table: "public.missing", Projection: []string{"id"}, Limit: 1}); explanation.Allowed {
-		t.Fatalf("stale explanation = %#v", explanation)
+	for _, test := range []struct {
+		name  string
+		plan  query.Plan
+		allow bool
+	}{
+		{"allowed", query.Plan{Source: "primary", Table: "public.orders", Projection: []string{"id"}, Limit: 1}, true},
+		{"denied", query.Plan{Source: "primary", Table: "public.orders", Projection: []string{"secret"}, Limit: 1}, false},
+		{"invalid", query.Plan{Source: "primary", Table: "orders", Projection: []string{"id"}, Limit: 1}, false},
+		{"metadata missing", query.Plan{Source: "primary", Table: "public.missing", Projection: []string{"id"}, Limit: 1}, false},
+	} {
+		if explanation := local.Explain(test.plan); explanation.Allowed != test.allow {
+			t.Fatalf("%s explanation = %#v", test.name, explanation)
+		}
 	}
 	if executor.calls != 0 {
 		t.Fatalf("explain executed: %d", executor.calls)
@@ -143,6 +151,14 @@ func TestTrustedPrincipalBindingIsStableAndLocalIsExplicit(t *testing.T) {
 	}
 	if _, err := reader.Execute(context.Background(), plan); err != nil {
 		t.Fatalf("reader binding = %v", err)
+	}
+	developerSchema, err := developer.Schema("primary")
+	if err != nil || len(developerSchema.Relations()[0].Columns()) != 1 {
+		t.Fatalf("developer schema = %#v, %v", developerSchema, err)
+	}
+	readerSchema, err := reader.Schema("primary")
+	if err != nil || len(readerSchema.Relations()[0].Columns()) != 2 {
+		t.Fatalf("reader schema = %#v, %v", readerSchema, err)
 	}
 	if _, err := runtime.Bind(principal.Trusted{}); err == nil {
 		t.Fatal("zero principal was bound")
