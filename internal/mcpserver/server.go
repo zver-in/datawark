@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -97,10 +98,28 @@ func queryTool(gateway Gateway) mcp.ToolHandler {
 		}
 		result, err := gateway.Execute(ctx, plan)
 		if err != nil {
-			return toolError("query unavailable"), nil
+			return toolError(queryFailureMessage(err)), nil
 		}
 		return toolResult(queryResult{Columns: result.Columns, Rows: result.Rows}), nil
 	}
+}
+
+func queryFailureMessage(err error) string {
+	var executionError execution.Error
+	if errors.As(err, &executionError) {
+		switch executionError.Category {
+		case execution.ErrorTimeout, execution.ErrorCapacity, execution.ErrorRowLimit, execution.ErrorResultSize:
+			return "query guardrail"
+		case execution.ErrorUnavailable:
+			return "query unavailable"
+		default:
+			return "query failed"
+		}
+	}
+	if strings.HasPrefix(err.Error(), "policy:") {
+		return "query denied"
+	}
+	return "query unavailable"
 }
 
 func explainTool(gateway Gateway) mcp.ToolHandler {

@@ -21,8 +21,8 @@
 ## 4. Transport integration
 
 - [x] 4.1 Mount all REST routes behind request ID and API-key middleware on the shared listener; verify probes remain anonymous and all REST data routes require authentication.
-- [ ] 4.2 Add Docker-backed end-to-end tests for allowed query, deny, explain, schema filtering, runtime guardrails, audit failure, and two-principal isolation; verify `make test-integration` passes.
-- [ ] 4.3 Add parity tests comparing REST with MCP stdio for equivalent principals and plans; verify allow, deny, and stable failure categories match.
+- [x] 4.2 Add Docker-backed end-to-end tests for allowed query, deny, explain, schema filtering, runtime guardrails, audit failure, and two-principal isolation; verify `make test-integration` passes.
+- [x] 4.3 Add parity tests comparing REST with MCP stdio for equivalent principals and plans; verify allow, deny, and stable failure categories match.
 
 ## Workflow follow-up
 

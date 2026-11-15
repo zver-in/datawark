@@ -36,6 +36,9 @@ func (gateway mcpGateway) Execute(_ context.Context, plan query.Plan) (execution
 	if plan.Source != gateway.principal {
 		return execution.Result{}, errors.New("policy: query is not authorized")
 	}
+	if plan.Limit > 1 {
+		return execution.Result{}, execution.Error{Category: execution.ErrorRowLimit}
+	}
 	return execution.Result{Columns: []string{"id"}, Rows: [][]any{{int64(1)}}}, nil
 }
 func (gateway mcpGateway) Explain(plan query.Plan) policy.Explanation {
@@ -162,14 +165,19 @@ func TestMCPHTTPStdioAndRESTAgreeOnOutcomeCategory(t *testing.T) {
 		arguments any
 		isError   bool
 		status    int
+		category  string
 	}{
-		{"allowed", plan("reader"), false, http.StatusOK},
-		{"denied", plan("writer"), true, http.StatusForbidden},
+		{"allowed", plan("reader"), false, http.StatusOK, ""},
+		{"denied", plan("writer"), true, http.StatusForbidden, "denied"},
+		{"guardrail", guardedPlan("reader"), true, http.StatusUnprocessableEntity, "guardrail"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			remoteResult, err := remote.CallTool(context.Background(), &mcp.CallToolParams{Name: "query_data", Arguments: test.arguments})
 			if err != nil || remoteResult.IsError != test.isError {
 				t.Fatalf("MCP HTTP result=%#v err=%v", remoteResult, err)
+			}
+			if test.category != "" && !strings.Contains(toolText(t, remoteResult), test.category) {
+				t.Fatalf("MCP HTTP category=%q", toolText(t, remoteResult))
 			}
 
 			serverTransport, clientTransport := mcp.NewInMemoryTransports()
@@ -187,6 +195,9 @@ func TestMCPHTTPStdioAndRESTAgreeOnOutcomeCategory(t *testing.T) {
 			if err != nil || stdioResult.IsError != test.isError {
 				t.Fatalf("MCP stdio result=%#v err=%v", stdioResult, err)
 			}
+			if test.category != "" && !strings.Contains(toolText(t, stdioResult), test.category) {
+				t.Fatalf("MCP stdio category=%q", toolText(t, stdioResult))
+			}
 
 			data, _ := json.Marshal(test.arguments)
 			request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/query", strings.NewReader(string(data)))
@@ -198,6 +209,16 @@ func TestMCPHTTPStdioAndRESTAgreeOnOutcomeCategory(t *testing.T) {
 			response, err := http.DefaultClient.Do(request)
 			if err != nil || response.StatusCode != test.status {
 				t.Fatalf("REST response=%v err=%v", response, err)
+			}
+			if test.category != "" {
+				var body struct {
+					Error struct {
+						Code string `json:"code"`
+					} `json:"error"`
+				}
+				if err := json.NewDecoder(response.Body).Decode(&body); err != nil || body.Error.Code != test.category {
+					t.Fatalf("REST category=%q err=%v", body.Error.Code, err)
+				}
 			}
 			response.Body.Close()
 		})
@@ -228,6 +249,12 @@ func connectMCP(t *testing.T, endpoint, key string) *mcp.ClientSession {
 
 func plan(source string) map[string]any {
 	return map[string]any{"source": source, "table": "public.orders", "projection": []string{"id"}, "filters": []any{}, "order": []any{}, "limit": 1}
+}
+
+func guardedPlan(source string) map[string]any {
+	value := plan(source)
+	value["limit"] = 2
+	return value
 }
 
 func toolText(t *testing.T, result *mcp.CallToolResult) string {

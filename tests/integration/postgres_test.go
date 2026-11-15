@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"datawark/internal/audit"
 	"datawark/internal/cli"
 	"datawark/internal/compiler"
 	"datawark/internal/config"
@@ -214,12 +216,12 @@ func TestRESTDataAPIExercisesSharedRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer connection.Close(context.Background())
-	for _, statement := range []string{"CREATE TABLE IF NOT EXISTS public.rest_api_fixture (id integer PRIMARY KEY, secret text)", "TRUNCATE public.rest_api_fixture", "INSERT INTO public.rest_api_fixture VALUES (1, 'hidden')"} {
+	for _, statement := range []string{"CREATE TABLE IF NOT EXISTS public.rest_api_fixture (id integer PRIMARY KEY, secret text)", "TRUNCATE public.rest_api_fixture", "INSERT INTO public.rest_api_fixture VALUES (1, 'hidden'), (2, 'hidden')"} {
 		if _, err := connection.Exec(context.Background(), statement); err != nil {
 			t.Fatal(err)
 		}
 	}
-	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "reader", HTTP: &config.HTTP{ListenAddress: "127.0.0.1:8080", APIKeys: []config.APIKey{{Principal: "reader", KeyEnv: "REST_READER"}, {Principal: "blocked", KeyEnv: "REST_BLOCKED"}}}}, Datasources: []config.Datasource{{Name: "test_postgres", Driver: "postgres", DSNEnv: "DATAWARK_TEST_POSTGRES_DSN"}}, Policies: []config.Policy{{Name: "reader", Principals: []string{"reader"}, Datasource: "test_postgres", Allow: []config.AllowEntry{{Table: "public.rest_api_fixture", Operations: []string{"select"}, Columns: []string{"id"}}}}}}
+	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "reader", Runtime: &config.Runtime{StatementTimeout: time.Second, MaxRows: 1, MaxResultBytes: 1024, MaxConcurrentQueries: 1}, HTTP: &config.HTTP{ListenAddress: "127.0.0.1:8080", APIKeys: []config.APIKey{{Principal: "reader", KeyEnv: "REST_READER"}, {Principal: "blocked", KeyEnv: "REST_BLOCKED"}}}}, Datasources: []config.Datasource{{Name: "test_postgres", Driver: "postgres", DSNEnv: "DATAWARK_TEST_POSTGRES_DSN"}}, Policies: []config.Policy{{Name: "reader", Principals: []string{"reader"}, Datasource: "test_postgres", Allow: []config.AllowEntry{{Table: "public.rest_api_fixture", Operations: []string{"select"}, Columns: []string{"id"}}}}}}
 	runtime, err := gatewayruntime.NewFromConfig(context.Background(), configuration, gatewayruntime.Dependencies{})
 	if err != nil {
 		t.Fatal(err)
@@ -258,6 +260,10 @@ func TestRESTDataAPIExercisesSharedRuntime(t *testing.T) {
 	if status, result := call("reader-key", "/api/v1/query", plan); status != http.StatusOK || len(result["rows"].([]any)) != 1 {
 		t.Fatalf("allowed REST result: %d %#v", status, result)
 	}
+	guarded := map[string]any{"source": "test_postgres", "table": "public.rest_api_fixture", "projection": []string{"id"}, "filters": []any{}, "order": []any{}, "limit": 2}
+	if status, result := call("reader-key", "/api/v1/query", guarded); status != http.StatusUnprocessableEntity || result["error"].(map[string]any)["code"] != "guardrail" {
+		t.Fatalf("guardrail REST result: %d %#v", status, result)
+	}
 	if status, result := call("blocked-key", "/api/v1/query", plan); status != http.StatusForbidden || result["error"].(map[string]any)["code"] != "denied" {
 		t.Fatalf("denied REST result: %d %#v", status, result)
 	}
@@ -276,6 +282,43 @@ func TestRESTDataAPIExercisesSharedRuntime(t *testing.T) {
 	if response.StatusCode != http.StatusOK || len(schemaBody["sources"].([]any)) != 0 {
 		t.Fatalf("schema isolation: %d %#v", response.StatusCode, schemaBody)
 	}
+
+	failingRecorder := &operationFailingRecorder{operation: audit.OperationQuery}
+	auditAuth, err := httpserver.NewAuthenticator(configuration.Server.HTTP.APIKeys, func(name string) (string, bool) {
+		return map[string]string{"REST_READER": "reader-key", "REST_BLOCKED": "blocked-key"}[name], true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditAuth.SetRecorder(failingRecorder)
+	auditServer := httptest.NewServer(httpserver.NewWithGateway("", auditAuth, func(identity principal.Trusted) (httpserver.Gateway, error) { return runtime.Bind(identity) }).Handler())
+	defer auditServer.Close()
+	request, _ = http.NewRequest(http.MethodPost, auditServer.URL+"/api/v1/query", strings.NewReader(`{"source":"test_postgres","table":"public.rest_api_fixture","projection":["id"],"filters":[],"order":[],"limit":1}`))
+	request.Header.Set("Authorization", "Bearer reader-key")
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var auditBody map[string]any
+	_ = json.NewDecoder(response.Body).Decode(&auditBody)
+	if response.StatusCode != http.StatusServiceUnavailable || auditBody["error"].(map[string]any)["code"] != "unavailable" || failingRecorder.calls != 2 {
+		t.Fatalf("audit failure response: %d %#v events=%d", response.StatusCode, auditBody, failingRecorder.calls)
+	}
+}
+
+type operationFailingRecorder struct {
+	operation audit.Operation
+	calls     int
+}
+
+func (recorder *operationFailingRecorder) Record(event audit.Event) error {
+	recorder.calls++
+	if event.Operation == recorder.operation {
+		return errors.New("audit writer unavailable")
+	}
+	return nil
 }
 
 func TestRuntimeBootstrapIsAllOrNothing(t *testing.T) {
