@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
 	"github.com/spf13/cobra"
 )
 
@@ -246,6 +249,48 @@ func TestMCPHTTPUsesSharedRuntimePipeline(t *testing.T) {
 		text := result.Content[0].(*mcp.TextContent).Text
 		if strings.Contains(text, "hidden") {
 			t.Fatalf("MCP HTTP leaked hidden data: %s", text)
+		}
+	}
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/query", strings.NewReader(`{"source":"test_postgres","table":"public.mcp_http_fixture","projection":["id"],"filters":[],"order":[],"limit":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer reader-key")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("REST request status = %d", response.StatusCode)
+	}
+	response, err = http.Get(server.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	metricText, err := io.ReadAll(response.Body)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("metrics status=%d err=%v", response.StatusCode, err)
+	}
+	if strings.Contains(string(metricText), "reader-key") || strings.Contains(string(metricText), "hidden") || strings.Contains(string(metricText), "mcp_http_fixture") {
+		t.Fatalf("metrics leaked protected value: %q", metricText)
+	}
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(metricText))
+	if err != nil {
+		t.Fatalf("parse metrics: %v", err)
+	}
+	for _, name := range []string{"datawark_gateway_requests_total", "datawark_gateway_request_duration_seconds"} {
+		family := families[name]
+		if family == nil || len(family.Metric) < 3 {
+			t.Fatalf("metric family %s = %#v", name, family)
+		}
+		for _, metric := range family.Metric {
+			if len(metric.Label) != 6 {
+				t.Fatalf("metric labels for %s = %#v", name, metric.Label)
+			}
 		}
 	}
 }

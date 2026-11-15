@@ -3,6 +3,7 @@ package runtime
 
 import (
 	"context"
+	"datawark/internal/compiler"
 	"datawark/internal/config"
 	"datawark/internal/execution"
 	"datawark/internal/policy"
@@ -26,6 +27,7 @@ type Dependencies struct {
 	LoadConfig Loader
 	Catalog    CatalogLoader
 	Executor   execution.Executor
+	Compile    func(policy.AuthorizedQuery) (compiler.Statement, error)
 }
 
 // Runtime owns one configuration and one snapshot per configured datasource.
@@ -34,6 +36,7 @@ type Runtime struct {
 	configuration config.Config
 	snapshots     map[string]schema.Snapshot
 	executor      execution.Executor
+	compile       func(policy.AuthorizedQuery) (compiler.Statement, error)
 }
 
 // Gateway is a principal-bound runtime surface suitable for transport adapters.
@@ -85,7 +88,7 @@ func NewFromConfig(ctx context.Context, configuration config.Config, dependencie
 	if dependencies.Executor == nil {
 		dependencies.Executor = postgres.NewExecutor()
 	}
-	return &Runtime{configuration: configuration, snapshots: snapshots, executor: dependencies.Executor}, nil
+	return &Runtime{configuration: configuration, snapshots: snapshots, executor: dependencies.Executor, compile: dependencies.Compile}, nil
 }
 
 // Bind returns a facade that performs all operations as one trusted principal.
@@ -116,7 +119,7 @@ func (gateway gateway) Execute(ctx context.Context, plan query.Plan) (execution.
 	if !found {
 		return execution.Result{}, errors.New("runtime: datasource is unavailable")
 	}
-	service := execution.QueryService{Configuration: cloneConfig(runtime.configuration), Snapshot: snapshot, Executor: runtime.executor, Principal: gateway.principal}
+	service := execution.QueryService{Configuration: cloneConfig(runtime.configuration), Snapshot: snapshot, Executor: runtime.executor, Compile: runtime.compile, Principal: gateway.principal}
 	return service.Execute(ctx, plan)
 }
 

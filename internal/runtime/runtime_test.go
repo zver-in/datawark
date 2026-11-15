@@ -5,6 +5,7 @@ import (
 	"datawark/internal/compiler"
 	"datawark/internal/config"
 	"datawark/internal/execution"
+	"datawark/internal/policy"
 	"datawark/internal/postgres"
 	"datawark/internal/principal"
 	"datawark/internal/query"
@@ -35,6 +36,13 @@ type executorFake struct{ calls int }
 func (fake *executorFake) Execute(context.Context, config.Config, string, compiler.Statement) (execution.Result, error) {
 	fake.calls++
 	return execution.Result{}, nil
+}
+
+type compilerFake struct{ calls int }
+
+func (fake *compilerFake) Compile(policy.AuthorizedQuery) (compiler.Statement, error) {
+	fake.calls++
+	return compiler.Statement{}, nil
 }
 
 func TestNewBootstrapsCompleteImmutableRuntime(t *testing.T) {
@@ -88,7 +96,8 @@ func TestBootstrapFailsClosedWithoutSecrets(t *testing.T) {
 
 func TestRuntimeOperationsNeverExecuteRejectedPlans(t *testing.T) {
 	executor := &executorFake{}
-	runtime, err := NewFromConfig(context.Background(), testConfig(), Dependencies{Catalog: catalogFake{snapshots: map[string]schema.Snapshot{"primary": schema.NewSnapshot("primary", []schema.Relation{schema.NewRelation("public", "orders", []schema.Column{{Name: "id"}, {Name: "secret"}})}), "reporting": schema.NewSnapshot("reporting", nil)}}, Executor: executor})
+	compiler := &compilerFake{}
+	runtime, err := NewFromConfig(context.Background(), testConfig(), Dependencies{Catalog: catalogFake{snapshots: map[string]schema.Snapshot{"primary": schema.NewSnapshot("primary", []schema.Relation{schema.NewRelation("public", "orders", []schema.Column{{Name: "id"}, {Name: "secret"}})}), "reporting": schema.NewSnapshot("reporting", nil)}}, Executor: executor, Compile: compiler.Compile})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +133,9 @@ func TestRuntimeOperationsNeverExecuteRejectedPlans(t *testing.T) {
 	}
 	if executor.calls != 0 {
 		t.Fatalf("explain executed: %d", executor.calls)
+	}
+	if compiler.calls != 0 {
+		t.Fatalf("explain compiled: %d", compiler.calls)
 	}
 }
 

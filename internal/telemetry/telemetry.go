@@ -51,6 +51,40 @@ func Snapshot(ctx context.Context) (transport, operation, auth, policy, executio
 	return v.Transport, v.Operation, v.Auth, v.Policy, v.Execution
 }
 
+// Outcome derives the one safe completion category from bounded request
+// annotations. More specific security and execution outcomes take precedence
+// over the eventual HTTP status so transport adapters cannot disagree.
+func Outcome(ctx context.Context, status int) string {
+	_, _, authentication, policy, execution := Snapshot(ctx)
+	switch {
+	case authentication == "unauthenticated":
+		return "unauthenticated"
+	case policy == "denied":
+		return "denied"
+	case execution != "not_applicable":
+		return enum(execution, "success", "timeout", "capacity", "row_limit", "result_size", "unavailable", "internal")
+	}
+	switch status {
+	case 401:
+		return "unauthenticated"
+	case 403:
+		return "denied"
+	case 408:
+		return "timeout"
+	case 429:
+		return "capacity"
+	case 503:
+		return "unavailable"
+	}
+	if status >= 500 && status <= 599 {
+		return "internal"
+	}
+	if status >= 200 && status <= 399 {
+		return "success"
+	}
+	return Other
+}
+
 func value(ctx context.Context) *values {
 	if v, ok := ctx.Value(contextKey{}).(*values); ok && v != nil {
 		return v

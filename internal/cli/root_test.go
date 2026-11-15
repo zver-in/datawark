@@ -413,6 +413,30 @@ func TestPolicyExplainFailuresAreSafeAndDoNotBootstrap(t *testing.T) {
 	}
 }
 
+func TestPolicyExplainValidPlanFailsSafelyDuringBootstrapAndBinding(t *testing.T) {
+	plan := `{"source":"analytics","table":"public.orders","projection":["id"],"limit":1}`
+	secret := "postgres://reader:distinctive-secret@example.test/db"
+	for _, test := range []struct {
+		name string
+		deps Dependencies
+	}{
+		{"bootstrap", Dependencies{Runtime: func(context.Context, string) (*runtime.Runtime, error) { return nil, errors.New(secret) }}},
+		{"binding", Dependencies{Runtime: func(context.Context, string) (*runtime.Runtime, error) { return explainRuntime(t), nil }, LocalGateway: func(*runtime.Runtime) (runtime.Gateway, error) { return nil, errors.New(secret) }}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := NewRootCommand(test.deps)
+			var stdout, stderr bytes.Buffer
+			command.SetIn(strings.NewReader(plan))
+			command.SetOut(&stdout)
+			command.SetErr(&stderr)
+			command.SetArgs([]string{"policy", "explain", "--config", "gateway.yaml", "--plan", "-"})
+			if err := command.Execute(); err == nil || stdout.Len() != 0 || stderr.Len() != 0 || strings.Contains(err.Error(), secret) {
+				t.Fatalf("stdout=%q stderr=%q err=%v", stdout.String(), stderr.String(), err)
+			}
+		})
+	}
+}
+
 func TestPolicyExplainCLIWritesOnlySafeDiagnostics(t *testing.T) {
 	secret := "postgres://reader:secret@example.test/db"
 	t.Setenv("DATAWARK_CLI_EXPLAIN_SECRET", secret)

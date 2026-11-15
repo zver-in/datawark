@@ -36,16 +36,17 @@ type Bootstrap func(context.Context, string) (*runtime.Runtime, config.Config, e
 type ListenerFactory func(string, string) (net.Listener, error)
 
 type Dependencies struct {
-	Load      Loader
-	Lookup    func(string) (string, bool)
-	Pinger    Pinger
-	Runtime   func(context.Context, string) (*runtime.Runtime, error)
-	RunMCP    func(context.Context, runtime.Gateway) error
-	Bootstrap Bootstrap
-	Listen    ListenerFactory
-	NewHTTP   func(string, *httpserver.Authenticator) *httpserver.Server
-	NewAuth   func([]config.APIKey, func(string) (string, bool)) (*httpserver.Authenticator, error)
-	Open      func(string) (io.ReadCloser, error)
+	Load         Loader
+	Lookup       func(string) (string, bool)
+	Pinger       Pinger
+	Runtime      func(context.Context, string) (*runtime.Runtime, error)
+	LocalGateway func(*runtime.Runtime) (runtime.Gateway, error)
+	RunMCP       func(context.Context, runtime.Gateway) error
+	Bootstrap    Bootstrap
+	Listen       ListenerFactory
+	NewHTTP      func(string, *httpserver.Authenticator) *httpserver.Server
+	NewAuth      func([]config.APIKey, func(string) (string, bool)) (*httpserver.Authenticator, error)
+	Open         func(string) (io.ReadCloser, error)
 }
 
 const maxPlanBytes int64 = 1 << 20
@@ -72,6 +73,9 @@ func NewRootCommand(deps Dependencies) *cobra.Command {
 		deps.Runtime = func(ctx context.Context, path string) (*runtime.Runtime, error) {
 			return runtime.New(ctx, path, runtime.Dependencies{})
 		}
+	}
+	if deps.LocalGateway == nil {
+		deps.LocalGateway = func(value *runtime.Runtime) (runtime.Gateway, error) { return value.LocalGateway() }
 	}
 	if deps.RunMCP == nil {
 		deps.RunMCP = mcpserver.Run
@@ -120,7 +124,7 @@ func newPolicyCommand(deps Dependencies) *cobra.Command {
 			if err != nil || runtime == nil {
 				return errors.New("policy runtime bootstrap failed")
 			}
-			gateway, err := runtime.LocalGateway()
+			gateway, err := deps.LocalGateway(runtime)
 			if err != nil || gateway == nil {
 				return errors.New("policy runtime bootstrap failed")
 			}

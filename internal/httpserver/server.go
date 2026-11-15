@@ -78,6 +78,8 @@ func newServer(address string, bind GatewayBinder, recorder audit.Recorder, auth
 	if len(authenticators) == 1 && authenticators[0] != nil {
 		handler = authenticators[0].middleware(handler)
 	}
+	// Request metadata must be installed before observation so the outer
+	// completion boundary sees annotations refined by authentication and routes.
 	handler = service.observe(handler)
 	handler = service.requestID(handler)
 	service.server = &http.Server{
@@ -224,7 +226,7 @@ func (service *Server) observe(next http.Handler) http.Handler {
 		elapsed := time.Since(started)
 		_ = service.metrics.Record(request.Context(), captured.status, elapsed)
 		transport, operation, auth, policy, execution := telemetry.Snapshot(request.Context())
-		service.logger.Info("http request complete", "request_id", RequestID(request.Context()), "transport", transport, "operation", operation, "authentication", auth, "policy", policy, "execution", execution, "status_class", telemetry.StatusClass(captured.status), "status", captured.status, "bytes", captured.bytes, "duration_ms", elapsed.Milliseconds())
+		service.logger.Info("http request complete", "request_id", RequestID(request.Context()), "transport", transport, "operation", operation, "outcome", telemetry.Outcome(request.Context(), captured.status), "authentication", auth, "policy", policy, "execution", execution, "status_class", telemetry.StatusClass(captured.status), "status", captured.status, "bytes", captured.bytes, "duration_ms", elapsed.Milliseconds())
 	})
 }
 

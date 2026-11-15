@@ -161,6 +161,7 @@ func (api *restAPI) schemaList(writer http.ResponseWriter, request *http.Request
 }
 
 func (api *restAPI) schemaGet(writer http.ResponseWriter, request *http.Request) {
+	telemetry.SetOperation(request.Context(), "schema_get")
 	identity, ok := Principal(request.Context())
 	if !ok || api.bind == nil {
 		unauthorized(writer, request)
