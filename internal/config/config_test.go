@@ -45,6 +45,31 @@ func TestParseValidFixture(t *testing.T) {
 	if got := cfg.Server.RuntimeLimits(); got != DefaultRuntime() {
 		t.Fatalf("runtime defaults = %#v", got)
 	}
+	if got := cfg.Server.HTTPListener(); got != DefaultHTTP() {
+		t.Fatalf("HTTP defaults = %#v", got)
+	}
+}
+
+func TestParseHTTPListener(t *testing.T) {
+	t.Parallel()
+	base := "version: v1alpha1\nserver:\n  developmentPrincipal: reader\ndatasources:\n  - name: analytics\n    driver: postgres\n    dsnEnv: DATAWARK_ANALYTICS_DSN\npolicies:\n  - name: orders\n    principals: [reader]\n    datasource: analytics\n    allow:\n      - table: public.orders\n        operations: [select]\n        columns: [id]\n"
+	valid := strings.Replace(base, "datasources:", "  http:\n    listenAddress: 127.0.0.1:9090\ndatasources:", 1)
+	cfg, err := Parse([]byte(valid))
+	if err != nil || cfg.Server.HTTPListener().ListenAddress != "127.0.0.1:9090" {
+		t.Fatalf("Parse() = %#v, %v", cfg.Server.HTTP, err)
+	}
+	for name, value := range map[string]string{
+		"malformed": "not-an-address",
+		"unknown":   "127.0.0.1:9090\n    unsafe: postgres://reader:secret@example.test/db",
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := strings.Replace(base, "datasources:", "  http:\n    listenAddress: "+value+"\ndatasources:", 1)
+			_, err := Parse([]byte(data))
+			if err == nil || !strings.Contains(err.Error(), "server.http") || strings.Contains(err.Error(), "secret") {
+				t.Fatalf("unsafe HTTP error: %v", err)
+			}
+		})
+	}
 }
 
 func TestParseRuntimeLimits(t *testing.T) {

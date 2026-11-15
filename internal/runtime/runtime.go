@@ -191,5 +191,9 @@ func cloneConfig(configuration config.Config) config.Config {
 		runtime := *configuration.Server.Runtime
 		copy.Server.Runtime = &runtime
 	}
+	if configuration.Server.HTTP != nil {
+		http := *configuration.Server.HTTP
+		copy.Server.HTTP = &http
+	}
 	return copy
 }

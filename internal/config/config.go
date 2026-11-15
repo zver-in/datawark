@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +22,7 @@ const (
 	DefaultMaxRows              = 1000
 	DefaultMaxResultBytes       = 4 * 1024 * 1024
 	DefaultMaxConcurrentQueries = 16
+	DefaultHTTPListenAddress    = "127.0.0.1:8080"
 )
 
 type Config struct {
@@ -32,6 +35,21 @@ type Config struct {
 type Server struct {
 	DevelopmentPrincipal string   `yaml:"developmentPrincipal"`
 	Runtime              *Runtime `yaml:"runtime"`
+	HTTP                 *HTTP    `yaml:"http"`
+}
+
+// HTTP configures the single Gateway HTTP listener.
+type HTTP struct {
+	ListenAddress string `yaml:"listenAddress"`
+}
+
+func DefaultHTTP() HTTP { return HTTP{ListenAddress: DefaultHTTPListenAddress} }
+
+func (server Server) HTTPListener() HTTP {
+	if server.HTTP == nil {
+		return DefaultHTTP()
+	}
+	return *server.HTTP
 }
 
 type Runtime struct {
@@ -126,6 +144,10 @@ func Parse(data []byte) (Config, error) {
 		defaults := DefaultRuntime()
 		cfg.Server.Runtime = &defaults
 	}
+	if cfg.Server.HTTP == nil {
+		defaults := DefaultHTTP()
+		cfg.Server.HTTP = &defaults
+	}
 	return cfg, nil
 }
 
@@ -159,8 +181,9 @@ func unknownFieldViolation(document *yaml.Node) *Violation {
 	}
 	return checkMapping(document.Content[0], "", map[string]map[string]struct{}{
 		"":                   fieldSet("version", "server", "datasources", "policies"),
-		"server":             fieldSet("developmentPrincipal", "runtime"),
+		"server":             fieldSet("developmentPrincipal", "runtime", "http"),
 		"server.runtime":     fieldSet("statementTimeout", "maxRows", "maxResultBytes", "maxConcurrentQueries"),
+		"server.http":        fieldSet("listenAddress"),
 		"datasources[]":      fieldSet("name", "driver", "dsnEnv"),
 		"policies[]":         fieldSet("name", "principals", "datasource", "allow"),
 		"policies[].allow[]": fieldSet("table", "operations", "columns"),
@@ -188,7 +211,7 @@ func checkMapping(node *yaml.Node, path string, allowed map[string]map[string]st
 		}
 		childPath := joinPath(path, field)
 		switch childPath {
-		case "server", "server.runtime":
+		case "server", "server.runtime", "server.http":
 			if violation := checkMapping(value, childPath, allowed); violation != nil {
 				return violation
 			}
@@ -258,6 +281,11 @@ func Validate(cfg Config) error {
 		}
 		if runtime.MaxConcurrentQueries <= 0 {
 			add("server.runtime.maxConcurrentQueries", "must be positive")
+		}
+	}
+	if http := cfg.Server.HTTP; http != nil {
+		if !validListenAddress(http.ListenAddress) {
+			add("server.http.listenAddress", "must be a valid host and port")
 		}
 	}
 
@@ -334,6 +362,18 @@ func Validate(cfg Config) error {
 		return &ValidationError{Violations: violations}
 	}
 	return nil
+}
+
+func validListenAddress(address string) bool {
+	if strings.TrimSpace(address) != address || address == "" {
+		return false
+	}
+	_, port, err := net.SplitHostPort(address)
+	if err != nil || port == "" {
+		return false
+	}
+	value, err := strconv.Atoi(port)
+	return err == nil && value > 0 && value <= 65535
 }
 
 func FindDatasource(cfg Config, name string) (Datasource, bool) {

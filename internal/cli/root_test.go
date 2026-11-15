@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"datawark/internal/config"
 	"datawark/internal/runtime"
@@ -32,6 +35,11 @@ func TestConfigValidate(t *testing.T) {
 	_, err = run(NewRootCommand(Dependencies{}), "config", "validate", "--config", filepath.Join("..", "config", "testdata", "invalid-driver.yaml"))
 	if err == nil || !strings.Contains(err.Error(), "datasources[0].driver") {
 		t.Fatalf("error=%v", err)
+	}
+	example := filepath.Join("..", "..", "configs", "examples", "gateway-v1alpha1.yaml")
+	output, err = run(NewRootCommand(Dependencies{}), "config", "validate", "--config", example)
+	if err != nil || !strings.Contains(output, "configuration is valid") {
+		t.Fatalf("example output=%q err=%v", output, err)
 	}
 }
 
@@ -95,6 +103,72 @@ func TestMCPStdioBootstrapsBeforeServingAndKeepsErrorsOffStdout(t *testing.T) {
 	command.SetArgs([]string{"mcp", "stdio", "--config", "gateway.yaml"})
 	if err := command.Execute(); err == nil || started || stdout.Len() != 0 || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("stdout=%q err=%v started=%v", stdout.String(), err, started)
+	}
+}
+
+func TestServeIntegrationBootstrapsBeforeBindingAndShutsDown(t *testing.T) {
+	secret := "postgres://reader:secret@example.test/db"
+	for _, bootstrapErr := range []error{errors.New("invalid configuration"), errors.New(secret)} {
+		listenerCalled := false
+		command := NewRootCommand(Dependencies{
+			Bootstrap: func(context.Context, string) (*runtime.Runtime, config.Config, error) {
+				return nil, config.Config{}, bootstrapErr
+			},
+			Listen: func(string, string) (net.Listener, error) {
+				listenerCalled = true
+				return nil, nil
+			},
+		})
+		if _, err := run(command, "serve", "--config", "invalid.yaml"); err == nil || listenerCalled || strings.Contains(err.Error(), secret) {
+			t.Fatalf("error=%v listenerCalled=%v", err, listenerCalled)
+		}
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	command := NewRootCommand(Dependencies{
+		Bootstrap: func(context.Context, string) (*runtime.Runtime, config.Config, error) {
+			return mcpRuntime(t), config.Config{Server: config.Server{HTTP: &config.HTTP{ListenAddress: listener.Addr().String()}}}, nil
+		},
+		Listen: func(string, string) (net.Listener, error) { return listener, nil },
+	})
+	command.SetContext(ctx)
+	done := make(chan error, 1)
+	go func() {
+		_, err := run(command, "serve", "--config", "gateway.yaml")
+		done <- err
+	}()
+	endpoint := "http://" + listener.Addr().String()
+	deadline := time.Now().Add(time.Second)
+	for {
+		response, requestErr := http.Get(endpoint + "/api/v1/health")
+		if requestErr == nil {
+			_ = response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("health status = %d", response.StatusCode)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal(requestErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	response, err := http.Get(endpoint + "/api/v1/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("ready status = %d", response.StatusCode)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 

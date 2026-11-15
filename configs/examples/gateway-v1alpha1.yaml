@@ -2,6 +2,9 @@ version: v1alpha1
 
 server:
   developmentPrincipal: local-dev
+  # Defaults to 127.0.0.1:8080; keep loopback until HTTP authentication is configured.
+  http:
+    listenAddress: 127.0.0.1:8080
   runtime:
     statementTimeout: 5s
     maxRows: 1000

@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"datawark/internal/config"
+	"datawark/internal/httpserver"
 	"datawark/internal/mcpserver"
 	"datawark/internal/postgres"
 	"datawark/internal/runtime"
@@ -23,12 +27,18 @@ type Pinger interface {
 	Ping(context.Context, string) error
 }
 
+type Bootstrap func(context.Context, string) (*runtime.Runtime, config.Config, error)
+type ListenerFactory func(string, string) (net.Listener, error)
+
 type Dependencies struct {
-	Load    Loader
-	Lookup  func(string) (string, bool)
-	Pinger  Pinger
-	Runtime func(context.Context, string) (*runtime.Runtime, error)
-	RunMCP  func(context.Context, runtime.Gateway) error
+	Load      Loader
+	Lookup    func(string) (string, bool)
+	Pinger    Pinger
+	Runtime   func(context.Context, string) (*runtime.Runtime, error)
+	RunMCP    func(context.Context, runtime.Gateway) error
+	Bootstrap Bootstrap
+	Listen    ListenerFactory
+	NewHTTP   func(string) *httpserver.Server
 }
 
 func NewRootCommand(deps Dependencies) *cobra.Command {
@@ -49,10 +59,65 @@ func NewRootCommand(deps Dependencies) *cobra.Command {
 	if deps.RunMCP == nil {
 		deps.RunMCP = mcpserver.Run
 	}
+	if deps.Bootstrap == nil {
+		deps.Bootstrap = func(ctx context.Context, path string) (*runtime.Runtime, config.Config, error) {
+			configuration, err := deps.Load(path)
+			if err != nil {
+				return nil, config.Config{}, err
+			}
+			gateway, err := runtime.NewFromConfig(ctx, configuration, runtime.Dependencies{})
+			return gateway, configuration, err
+		}
+	}
+	if deps.Listen == nil {
+		deps.Listen = net.Listen
+	}
+	if deps.NewHTTP == nil {
+		deps.NewHTTP = httpserver.New
+	}
 
 	root := &cobra.Command{Use: "datawark", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newConfigCommand(deps), newSourceCommand(deps), newMCPCommand(deps))
+	root.AddCommand(newConfigCommand(deps), newSourceCommand(deps), newMCPCommand(deps), newServeCommand(deps))
 	return root
+}
+
+func newServeCommand(deps Dependencies) *cobra.Command {
+	var path string
+	serve := &cobra.Command{
+		Use: "serve",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			gateway, configuration, err := deps.Bootstrap(ctx, path)
+			if err != nil || gateway == nil {
+				return errors.New("HTTP runtime bootstrap failed")
+			}
+			listener, err := deps.Listen("tcp", configuration.Server.HTTPListener().ListenAddress)
+			if err != nil {
+				return errors.New("HTTP listener could not be started")
+			}
+			service := deps.NewHTTP(configuration.Server.HTTPListener().ListenAddress)
+			serveErrors := make(chan error, 1)
+			go func() { serveErrors <- service.Serve(listener) }()
+			select {
+			case <-ctx.Done():
+				shutdown, cancel := context.WithTimeout(context.Background(), httpserver.ShutdownTimeout)
+				defer cancel()
+				if err := service.Shutdown(shutdown); err != nil {
+					return errors.New("HTTP server shutdown failed")
+				}
+				return <-serveErrors
+			case err := <-serveErrors:
+				if err != nil {
+					return errors.New("HTTP server failed")
+				}
+				return nil
+			}
+		},
+	}
+	serve.Flags().StringVar(&path, "config", "", "path to configuration YAML")
+	_ = serve.MarkFlagRequired("config")
+	return serve
 }
 
 func newMCPCommand(deps Dependencies) *cobra.Command {
