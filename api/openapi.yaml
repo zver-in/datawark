@@ -1,0 +1,42 @@
+openapi: 3.0.3
+info:
+  title: DataWark REST API
+  version: v1
+paths:
+  /api/v1/query:
+    post:
+      security: [{BearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/RequestID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/QueryPlan'}}}}
+      responses: {'200': {description: Query result, content: {application/json: {schema: {$ref: '#/components/schemas/QueryResult'}}}}, default: {$ref: '#/components/responses/Error'}}
+  /api/v1/query/explain:
+    post:
+      security: [{BearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/RequestID'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/QueryPlan'}}}}
+      responses: {'200': {description: Authorization explanation, content: {application/json: {schema: {$ref: '#/components/schemas/Explanation'}}}}, default: {$ref: '#/components/responses/Error'}}
+  /api/v1/schema:
+    get:
+      security: [{BearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/RequestID'}]
+      responses: {'200': {description: Visible schemas, content: {application/json: {schema: {$ref: '#/components/schemas/SchemaList'}}}}, default: {$ref: '#/components/responses/Error'}}
+  /api/v1/schema/{source}:
+    get:
+      security: [{BearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/RequestID'}, {name: source, in: path, required: true, schema: {type: string}}]
+      responses: {'200': {description: Visible schema, content: {application/json: {schema: {$ref: '#/components/schemas/Schema'}}}}, default: {$ref: '#/components/responses/Error'}}
+components:
+  securitySchemes: {BearerAuth: {type: http, scheme: bearer}}
+  parameters: {RequestID: {name: X-Request-ID, in: header, schema: {type: string}}}
+  responses: {Error: {description: Stable error, content: {application/json: {schema: {$ref: '#/components/schemas/ErrorEnvelope'}}}}}
+  schemas:
+    QueryPlan: {type: object, required: [source, table, projection, filters, order, limit], additionalProperties: false, properties: {source: {type: string}, table: {type: string}, projection: {type: array, items: {type: string}}, filters: {type: array, items: {$ref: '#/components/schemas/Filter'}}, order: {type: array, items: {$ref: '#/components/schemas/Order'}}, limit: {type: integer}}}
+    Filter: {type: object, required: [column, operator, value], additionalProperties: false, properties: {column: {type: string}, operator: {type: string, enum: [eq, neq, lt, lte, gt, gte]}, value: {}}}
+    Order: {type: object, required: [column, direction], additionalProperties: false, properties: {column: {type: string}, direction: {type: string, enum: [asc, desc]}}}
+    QueryResult: {type: object, required: [columns, rows], properties: {columns: {type: array, items: {type: string}}, rows: {type: array, items: {type: array, items: {}}}}}
+    Explanation: {type: object, required: [allowed, reason], properties: {allowed: {type: boolean}, reason: {type: string, enum: [allowed, denied]}}}
+    Column: {type: object, required: [name, type, nullable], properties: {name: {type: string}, type: {type: string}, nullable: {type: boolean}}}
+    Relation: {type: object, required: [schema, name, columns], properties: {schema: {type: string}, name: {type: string}, columns: {type: array, items: {$ref: '#/components/schemas/Column'}}}}
+    Schema: {type: object, required: [source, relations], properties: {source: {type: string}, relations: {type: array, items: {$ref: '#/components/schemas/Relation'}}}}
+    SchemaList: {type: object, required: [sources], properties: {sources: {type: array, items: {$ref: '#/components/schemas/Schema'}}}}
+    ErrorEnvelope: {type: object, required: [error], properties: {error: {type: object, required: [code, message, requestId], properties: {code: {type: string}, message: {type: string}, requestId: {type: string}}}}}

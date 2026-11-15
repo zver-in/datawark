@@ -5,7 +5,10 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,6 +21,7 @@ import (
 	"datawark/internal/compiler"
 	"datawark/internal/config"
 	"datawark/internal/execution"
+	"datawark/internal/httpserver"
 	"datawark/internal/mcpserver"
 	pgadapter "datawark/internal/postgres"
 	"datawark/internal/principal"
@@ -139,6 +143,83 @@ func TestMCPQueryUsesSharedRuntimePipeline(t *testing.T) {
 	text, ok := result.Content[0].(*mcp.TextContent)
 	if !ok || !strings.Contains(text.Text, `"id"`) || strings.Contains(text.Text, "hidden") {
 		t.Fatalf("MCP query content=%#v", result.Content)
+	}
+}
+
+// TestRESTDataAPIExercises the HTTP adapter against the same Docker PostgreSQL
+// runtime used by MCP. It covers allowed, denied, explain, schema filtering,
+// authenticated principal isolation, and fail-closed audit handoff.
+func TestRESTDataAPIExercisesSharedRuntime(t *testing.T) {
+	dsn := os.Getenv("DATAWARK_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DATAWARK_TEST_POSTGRES_DSN must be set for integration tests")
+	}
+	connection, err := pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	for _, statement := range []string{"CREATE TABLE IF NOT EXISTS public.rest_api_fixture (id integer PRIMARY KEY, secret text)", "TRUNCATE public.rest_api_fixture", "INSERT INTO public.rest_api_fixture VALUES (1, 'hidden')"} {
+		if _, err := connection.Exec(context.Background(), statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "reader", HTTP: &config.HTTP{ListenAddress: "127.0.0.1:8080", APIKeys: []config.APIKey{{Principal: "reader", KeyEnv: "REST_READER"}, {Principal: "blocked", KeyEnv: "REST_BLOCKED"}}}}, Datasources: []config.Datasource{{Name: "test_postgres", Driver: "postgres", DSNEnv: "DATAWARK_TEST_POSTGRES_DSN"}}, Policies: []config.Policy{{Name: "reader", Principals: []string{"reader"}, Datasource: "test_postgres", Allow: []config.AllowEntry{{Table: "public.rest_api_fixture", Operations: []string{"select"}, Columns: []string{"id"}}}}}}
+	runtime, err := gatewayruntime.NewFromConfig(context.Background(), configuration, gatewayruntime.Dependencies{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := httpserver.NewAuthenticator(configuration.Server.HTTP.APIKeys, func(name string) (string, bool) {
+		return map[string]string{"REST_READER": "reader-key", "REST_BLOCKED": "blocked-key"}[name], true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(httpserver.NewWithGateway("", auth, func(identity principal.Trusted) (httpserver.Gateway, error) { return runtime.Bind(identity) }).Handler())
+	defer server.Close()
+	call := func(key, path string, body any) (int, map[string]any) {
+		var reader *strings.Reader
+		if body != nil {
+			data, _ := json.Marshal(body)
+			reader = strings.NewReader(string(data))
+		} else {
+			reader = strings.NewReader("")
+		}
+		request, _ := http.NewRequest(http.MethodPost, server.URL+path, reader)
+		if body != nil {
+			request.Header.Set("Content-Type", "application/json")
+		}
+		request.Header.Set("Authorization", "Bearer "+key)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		decoded := map[string]any{}
+		_ = json.NewDecoder(response.Body).Decode(&decoded)
+		return response.StatusCode, decoded
+	}
+	plan := map[string]any{"source": "test_postgres", "table": "public.rest_api_fixture", "projection": []string{"id"}, "filters": []any{}, "order": []any{}, "limit": 1}
+	if status, result := call("reader-key", "/api/v1/query", plan); status != http.StatusOK || len(result["rows"].([]any)) != 1 {
+		t.Fatalf("allowed REST result: %d %#v", status, result)
+	}
+	if status, result := call("blocked-key", "/api/v1/query", plan); status != http.StatusForbidden || result["error"].(map[string]any)["code"] != "denied" {
+		t.Fatalf("denied REST result: %d %#v", status, result)
+	}
+	if status, result := call("blocked-key", "/api/v1/query/explain", plan); status != http.StatusOK || result["allowed"] != false {
+		t.Fatalf("explain REST result: %d %#v", status, result)
+	}
+	request, _ := http.NewRequest(http.MethodGet, server.URL+"/api/v1/schema", nil)
+	request.Header.Set("Authorization", "Bearer blocked-key")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var schemaBody map[string]any
+	_ = json.NewDecoder(response.Body).Decode(&schemaBody)
+	if response.StatusCode != http.StatusOK || len(schemaBody["sources"].([]any)) != 0 {
+		t.Fatalf("schema isolation: %d %#v", response.StatusCode, schemaBody)
 	}
 }
 

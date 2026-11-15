@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -37,6 +36,14 @@ type Authenticator struct {
 // SetRecorder configures the synchronous HTTP audit boundary.
 func (authenticator *Authenticator) SetRecorder(recorder audit.Recorder) {
 	authenticator.recorder = recorder
+}
+
+// Recorder returns the audit boundary shared by authenticated REST operations.
+func (authenticator *Authenticator) Recorder() audit.Recorder {
+	if authenticator == nil {
+		return nil
+	}
+	return authenticator.recorder
 }
 
 // NewAuthenticator resolves all configured secrets before the listener is
@@ -132,20 +139,10 @@ func operationalPath(path string) bool {
 }
 
 func unauthorized(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Content-Type", "application/json")
 	writer.Header().Set("WWW-Authenticate", "Bearer")
-	writer.WriteHeader(http.StatusUnauthorized)
-	_ = json.NewEncoder(writer).Encode(struct {
-		Error     string `json:"error"`
-		RequestID string `json:"requestId"`
-	}{Error: "unauthorized", RequestID: RequestID(request.Context())})
+	writeError(writer, request, http.StatusUnauthorized, "unauthenticated", "authentication is required")
 }
 
 func unavailable(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Content-Type", "application/json")
-	writer.WriteHeader(http.StatusServiceUnavailable)
-	_ = json.NewEncoder(writer).Encode(struct {
-		Error     string `json:"error"`
-		RequestID string `json:"requestId"`
-	}{Error: "unavailable", RequestID: RequestID(request.Context())})
+	writeError(writer, request, http.StatusServiceUnavailable, "unavailable", "service is unavailable")
 }

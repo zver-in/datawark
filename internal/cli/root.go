@@ -18,6 +18,7 @@ import (
 	"datawark/internal/httpserver"
 	"datawark/internal/mcpserver"
 	"datawark/internal/postgres"
+	"datawark/internal/principal"
 	"datawark/internal/runtime"
 	"github.com/spf13/cobra"
 )
@@ -44,6 +45,7 @@ type Dependencies struct {
 }
 
 func NewRootCommand(deps Dependencies) *cobra.Command {
+	newHTTPProvided := deps.NewHTTP != nil
 	if deps.Load == nil {
 		deps.Load = config.Load
 	}
@@ -84,11 +86,11 @@ func NewRootCommand(deps Dependencies) *cobra.Command {
 	}
 
 	root := &cobra.Command{Use: "datawark", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newConfigCommand(deps), newSourceCommand(deps), newMCPCommand(deps), newServeCommand(deps))
+	root.AddCommand(newConfigCommand(deps), newSourceCommand(deps), newMCPCommand(deps), newServeCommand(deps, newHTTPProvided))
 	return root
 }
 
-func newServeCommand(deps Dependencies) *cobra.Command {
+func newServeCommand(deps Dependencies, newHTTPProvided bool) *cobra.Command {
 	var path string
 	serve := &cobra.Command{
 		Use: "serve",
@@ -109,6 +111,11 @@ func newServeCommand(deps Dependencies) *cobra.Command {
 				return errors.New("HTTP listener could not be started")
 			}
 			service := deps.NewHTTP(configuration.Server.HTTPListener().ListenAddress, authenticator)
+			if !newHTTPProvided {
+				service = httpserver.NewWithGateway(configuration.Server.HTTPListener().ListenAddress, authenticator, func(identity principal.Trusted) (httpserver.Gateway, error) {
+					return gateway.Bind(identity)
+				})
+			}
 			serveErrors := make(chan error, 1)
 			go func() { serveErrors <- service.Serve(listener) }()
 			select {

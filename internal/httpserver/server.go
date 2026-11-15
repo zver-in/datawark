@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"datawark/internal/audit"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -37,10 +38,26 @@ type Server struct {
 }
 
 func New(address string, authenticators ...*Authenticator) *Server {
+	return newServer(address, nil, nil, authenticators...)
+}
+
+// NewWithGateway mounts the authenticated REST data API on the shared listener.
+func NewWithGateway(address string, authenticator *Authenticator, bind GatewayBinder) *Server {
+	var recorder audit.Recorder
+	if authenticator != nil {
+		recorder = authenticator.Recorder()
+	}
+	return newServer(address, bind, recorder, authenticator)
+}
+
+func newServer(address string, bind GatewayBinder, recorder audit.Recorder, authenticators ...*Authenticator) *Server {
 	service := &Server{}
 	router := chi.NewRouter()
 	router.Get("/api/v1/health", service.health)
 	router.Get("/api/v1/ready", service.readiness)
+	if bind != nil {
+		newRESTAPI(bind, recorder).routes(router)
+	}
 	var handler http.Handler = router
 	if len(authenticators) == 1 && authenticators[0] != nil {
 		handler = authenticators[0].middleware(handler)
