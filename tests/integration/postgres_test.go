@@ -33,6 +33,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/spf13/cobra"
 )
 
 func TestPostgreSQLIsReachable(t *testing.T) {
@@ -68,6 +69,60 @@ func TestSourceTestSucceeds(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if exitCode := cli.Execute([]string{"source", "test", "--config", configPath, "--datasource", "test-postgres"}, &stdout, &stderr); exitCode != 0 {
 		t.Fatalf("source test failed: stderr=%s", stderr.String())
+	}
+}
+
+func TestPolicyExplainCLIUsesFileAndStdinWithoutExecution(t *testing.T) {
+	dsn := os.Getenv("DATAWARK_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DATAWARK_TEST_POSTGRES_DSN must be set for integration tests")
+	}
+	connection, err := pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	if _, err := connection.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS public.cli_policy_explain_fixture (id integer PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(t.TempDir(), "gateway.yaml")
+	configuration := "version: v1alpha1\nserver:\n  developmentPrincipal: local-dev\ndatasources:\n  - name: test_postgres\n    driver: postgres\n    dsnEnv: DATAWARK_TEST_POSTGRES_DSN\npolicies:\n  - name: cli-explain-read\n    principals: [local-dev]\n    datasource: test_postgres\n    allow:\n      - table: public.cli_policy_explain_fixture\n        operations: [select]\n        columns: [id]\n"
+	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(planPath, []byte(`{"source":"test_postgres","table":"public.cli_policy_explain_fixture","projection":["id"],"limit":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	executor := &countingExecutor{}
+	newCommand := func() *cobra.Command {
+		return cli.NewRootCommand(cli.Dependencies{Runtime: func(ctx context.Context, path string) (*gatewayruntime.Runtime, error) {
+			return gatewayruntime.New(ctx, path, gatewayruntime.Dependencies{Executor: executor})
+		}})
+	}
+
+	command := newCommand()
+	var stdout, stderr bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	command.SetArgs([]string{"policy", "explain", "--config", configPath, "--plan", planPath})
+	if err := command.Execute(); err != nil || stdout.String() != "{\"version\":\"v1alpha1\",\"allowed\":true,\"reason\":\"allowed\",\"policyId\":\"cli-explain-read\"}\n" || stderr.Len() != 0 {
+		t.Fatalf("file stdout=%q stderr=%q err=%v", stdout.String(), stderr.String(), err)
+	}
+
+	command = newCommand()
+	stdout.Reset()
+	stderr.Reset()
+	command.SetIn(strings.NewReader(`{"source":"test_postgres","table":"public.cli_policy_explain_hidden","projection":["id"],"limit":1}`))
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	command.SetArgs([]string{"policy", "explain", "--config", configPath, "--plan", "-"})
+	if err := command.Execute(); err != nil || stdout.String() != "{\"version\":\"v1alpha1\",\"allowed\":false,\"reason\":\"denied\"}\n" || stderr.Len() != 0 {
+		t.Fatalf("stdin stdout=%q stderr=%q err=%v", stdout.String(), stderr.String(), err)
+	}
+	if executor.calls != 0 {
+		t.Fatalf("explain executed SQL %d times", executor.calls)
 	}
 }
 

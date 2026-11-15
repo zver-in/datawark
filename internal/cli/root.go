@@ -3,6 +3,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,8 +18,10 @@ import (
 	"datawark/internal/config"
 	"datawark/internal/httpserver"
 	"datawark/internal/mcpserver"
+	"datawark/internal/policy"
 	"datawark/internal/postgres"
 	"datawark/internal/principal"
+	"datawark/internal/query"
 	"datawark/internal/runtime"
 	"github.com/spf13/cobra"
 )
@@ -42,6 +45,16 @@ type Dependencies struct {
 	Listen    ListenerFactory
 	NewHTTP   func(string, *httpserver.Authenticator) *httpserver.Server
 	NewAuth   func([]config.APIKey, func(string) (string, bool)) (*httpserver.Authenticator, error)
+	Open      func(string) (io.ReadCloser, error)
+}
+
+const maxPlanBytes int64 = 1 << 20
+
+type planExplanation struct {
+	Version  string `json:"version"`
+	Allowed  bool   `json:"allowed"`
+	Reason   string `json:"reason"`
+	PolicyID string `json:"policyId,omitempty"`
 }
 
 func NewRootCommand(deps Dependencies) *cobra.Command {
@@ -84,10 +97,77 @@ func NewRootCommand(deps Dependencies) *cobra.Command {
 	if deps.NewAuth == nil {
 		deps.NewAuth = httpserver.NewAuthenticator
 	}
+	if deps.Open == nil {
+		deps.Open = func(path string) (io.ReadCloser, error) { return os.Open(path) }
+	}
 
 	root := &cobra.Command{Use: "datawark", SilenceUsage: true, SilenceErrors: true}
-	root.AddCommand(newConfigCommand(deps), newSourceCommand(deps), newMCPCommand(deps), newServeCommand(deps, newHTTPProvided))
+	root.AddCommand(newConfigCommand(deps), newSourceCommand(deps), newMCPCommand(deps), newPolicyCommand(deps), newServeCommand(deps, newHTTPProvided))
 	return root
+}
+
+func newPolicyCommand(deps Dependencies) *cobra.Command {
+	policyCommand := &cobra.Command{Use: "policy"}
+	var path, planSource string
+	explain := &cobra.Command{
+		Use: "explain",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			plan, err := readPlan(cmd.InOrStdin(), deps.Open, planSource)
+			if err != nil {
+				return errors.New("query plan input is invalid")
+			}
+			runtime, err := deps.Runtime(cmd.Context(), path)
+			if err != nil || runtime == nil {
+				return errors.New("policy runtime bootstrap failed")
+			}
+			gateway, err := runtime.LocalGateway()
+			if err != nil || gateway == nil {
+				return errors.New("policy runtime bootstrap failed")
+			}
+			explanation := gateway.Explain(plan.Plan)
+			result := explanationDTO(explanation)
+			if err := json.NewEncoder(cmd.OutOrStdout()).Encode(result); err != nil {
+				return errors.New("policy explanation output failed")
+			}
+			return nil
+		},
+	}
+	explain.Flags().StringVar(&path, "config", "", "path to configuration YAML")
+	explain.Flags().StringVar(&planSource, "plan", "", "path to canonical query plan JSON, or - for standard input")
+	_ = explain.MarkFlagRequired("config")
+	_ = explain.MarkFlagRequired("plan")
+	policyCommand.AddCommand(explain)
+	return policyCommand
+}
+
+func readPlan(stdin io.Reader, open func(string) (io.ReadCloser, error), source string) (query.ValidatedPlan, error) {
+	if source == "" {
+		return query.ValidatedPlan{}, errors.New("plan source is required")
+	}
+	reader := stdin
+	var file io.ReadCloser
+	if source != "-" {
+		var err error
+		file, err = open(source)
+		if err != nil {
+			return query.ValidatedPlan{}, errors.New("plan source unavailable")
+		}
+		defer file.Close()
+		reader = file
+	}
+	data, err := io.ReadAll(io.LimitReader(reader, maxPlanBytes+1))
+	if err != nil || int64(len(data)) > maxPlanBytes {
+		return query.ValidatedPlan{}, errors.New("plan source invalid")
+	}
+	return query.Decode(data)
+}
+
+func explanationDTO(explanation policy.Explanation) planExplanation {
+	result := planExplanation{Version: "v1alpha1", Allowed: explanation.Allowed, Reason: string(explanation.Reason)}
+	if explanation.Allowed {
+		result.PolicyID = explanation.PolicyID
+	}
+	return result
 }
 
 func newServeCommand(deps Dependencies, newHTTPProvided bool) *cobra.Command {

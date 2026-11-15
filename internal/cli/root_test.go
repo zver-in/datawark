@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"datawark/internal/config"
+	"datawark/internal/policy"
 	"datawark/internal/runtime"
 	"datawark/internal/schema"
 	"github.com/spf13/cobra"
@@ -226,6 +228,12 @@ func (mcpCatalog) Load(context.Context, config.Config, string) (schema.Snapshot,
 	return schema.NewSnapshot("analytics", nil), nil
 }
 
+type explainCatalog struct{}
+
+func (explainCatalog) Load(context.Context, config.Config, string) (schema.Snapshot, error) {
+	return schema.NewSnapshot("analytics", []schema.Relation{schema.NewRelation("public", "orders", []schema.Column{{Name: "id"}})}), nil
+}
+
 func mcpRuntime(t *testing.T) *runtime.Runtime {
 	t.Helper()
 	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "local-dev"}, Datasources: []config.Datasource{{Name: "analytics", Driver: "postgres", DSNEnv: "TEST_DSN"}}}
@@ -314,6 +322,133 @@ func TestMCPStdioProcessEmitsOnlyProtocolMessages(t *testing.T) {
 	if strings.Contains(first+second, `"version":"v1alpha1"`) || stderr.Len() != 0 {
 		t.Fatalf("stdout=%q stderr=%q", first+second, stderr.String())
 	}
+}
+
+func TestReadPlanRejectsUnsafeOrUnsupportedInput(t *testing.T) {
+	secret := "hostile-plan-value-9841"
+	valid := `{"source":"analytics","table":"public.orders","projection":["id"],"limit":1}`
+	for _, test := range []struct {
+		name   string
+		source string
+		input  string
+		open   func(string) (io.ReadCloser, error)
+	}{
+		{"missing", "", valid, nil},
+		{"unreadable", "plan.json", valid, func(string) (io.ReadCloser, error) { return nil, errors.New(secret) }},
+		{"oversized", "-", strings.Repeat("x", int(maxPlanBytes)+1), nil},
+		{"malformed", "-", `{"source":`, nil},
+		{"trailing", "-", valid + ` {}`, nil},
+		{"alias", "-", `{"source":"analytics","table":"public.orders","columns":["id"],"limit":1}`, nil},
+		{"unknown", "-", valid[:len(valid)-1] + `,"principal":"` + secret + `"}`, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := readPlan(strings.NewReader(test.input), test.open, test.source)
+			if err == nil || strings.Contains(err.Error(), secret) {
+				t.Fatalf("readPlan error = %v", err)
+			}
+		})
+	}
+}
+
+func TestExplanationDTOIsVersionedAndNonDisclosing(t *testing.T) {
+	allowed, err := json.Marshal(explanationDTO(policy.Explanation{Allowed: true, Reason: policy.ReasonAllowed, PolicyID: "orders-read"}))
+	if err != nil || string(allowed) != `{"version":"v1alpha1","allowed":true,"reason":"allowed","policyId":"orders-read"}` {
+		t.Fatalf("allowed = %s, %v", allowed, err)
+	}
+	denied, err := json.Marshal(explanationDTO(policy.Explanation{Reason: policy.ReasonDenied, PolicyID: "hidden-policy"}))
+	if err != nil || string(denied) != `{"version":"v1alpha1","allowed":false,"reason":"denied"}` {
+		t.Fatalf("denied = %s, %v", denied, err)
+	}
+}
+
+func TestPolicyExplainUsesLocalRuntimeAndProducesOneSafeJSONResult(t *testing.T) {
+	plan := `{"source":"analytics","table":"public.orders","projection":["id"],"limit":1}`
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(planPath, []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := NewRootCommand(Dependencies{Runtime: func(context.Context, string) (*runtime.Runtime, error) { return explainRuntime(t), nil }})
+	output, err := run(command, "policy", "explain", "--config", "gateway.yaml", "--plan", planPath)
+	if err != nil || output != "{\"version\":\"v1alpha1\",\"allowed\":true,\"reason\":\"allowed\",\"policyId\":\"orders-read\"}\n" {
+		t.Fatalf("output=%q err=%v", output, err)
+	}
+
+	command = NewRootCommand(Dependencies{Runtime: func(context.Context, string) (*runtime.Runtime, error) { return explainRuntime(t), nil }})
+	var stdout, stderr bytes.Buffer
+	command.SetIn(strings.NewReader(`{"source":"analytics","table":"public.hidden","projection":["id"],"limit":1}`))
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	command.SetArgs([]string{"policy", "explain", "--config", "gateway.yaml", "--plan", "-"})
+	if err := command.Execute(); err != nil || stdout.String() != "{\"version\":\"v1alpha1\",\"allowed\":false,\"reason\":\"denied\"}\n" || stderr.Len() != 0 {
+		t.Fatalf("stdout=%q stderr=%q err=%v", stdout.String(), stderr.String(), err)
+	}
+}
+
+func TestPolicyExplainDoesNotAcceptIdentityFlags(t *testing.T) {
+	for _, flag := range []string{"principal", "role"} {
+		t.Run(flag, func(t *testing.T) {
+			command := NewRootCommand(Dependencies{})
+			command.SetArgs([]string{"policy", "explain", "--config", "gateway.yaml", "--plan", "-", "--" + flag, "other"})
+			if err := command.Execute(); err == nil || strings.Contains(err.Error(), "other") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestPolicyExplainFailuresAreSafeAndDoNotBootstrap(t *testing.T) {
+	secret := "postgres://reader:secret@example.test/db"
+	called := false
+	command := NewRootCommand(Dependencies{Runtime: func(context.Context, string) (*runtime.Runtime, error) {
+		called = true
+		return nil, errors.New(secret)
+	}})
+	var stdout, stderr bytes.Buffer
+	command.SetIn(strings.NewReader(`{"source":"analytics","table":"public.orders","projection":["id"],"limit":1,"principal":"` + secret + `"}`))
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	command.SetArgs([]string{"policy", "explain", "--config", "gateway.yaml", "--plan", "-"})
+	if err := command.Execute(); err == nil || called || stdout.Len() != 0 || strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "principal") {
+		t.Fatalf("stdout=%q err=%v called=%v", stdout.String(), err, called)
+	}
+}
+
+func TestPolicyExplainCLIWritesOnlySafeDiagnostics(t *testing.T) {
+	secret := "postgres://reader:secret@example.test/db"
+	t.Setenv("DATAWARK_CLI_EXPLAIN_SECRET", secret)
+	planPath := filepath.Join(t.TempDir(), "hostile-plan.json")
+	if err := os.WriteFile(planPath, []byte(`{"source":"analytics","table":"private.`+secret+`","projection":["id"],"limit":1,"rawSql":"`+secret+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	exitCode := Execute([]string{"policy", "explain", "--config", "missing.yaml", "--plan", planPath}, &stdout, &stderr)
+	if exitCode == 0 || stdout.Len() != 0 || strings.Contains(stdout.String()+stderr.String(), secret) {
+		t.Fatalf("stdout=%q stderr=%q exit=%d", stdout.String(), stderr.String(), exitCode)
+	}
+}
+
+func TestPolicyExplainOutputFailureIsSafe(t *testing.T) {
+	command := NewRootCommand(Dependencies{Runtime: func(context.Context, string) (*runtime.Runtime, error) { return explainRuntime(t), nil }})
+	command.SetIn(strings.NewReader(`{"source":"analytics","table":"public.orders","projection":["id"],"limit":1}`))
+	command.SetOut(errorWriter{})
+	command.SetArgs([]string{"policy", "explain", "--config", "gateway.yaml", "--plan", "-"})
+	if err := command.Execute(); err == nil || strings.Contains(err.Error(), "writer secret") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+type errorWriter struct{}
+
+func (errorWriter) Write([]byte) (int, error) { return 0, errors.New("writer secret") }
+
+func explainRuntime(t *testing.T) *runtime.Runtime {
+	t.Helper()
+	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "local-dev"}, Datasources: []config.Datasource{{Name: "analytics", Driver: "postgres", DSNEnv: "TEST_DSN"}}, Policies: []config.Policy{{Name: "orders-read", Principals: []string{"local-dev"}, Datasource: "analytics", Allow: []config.AllowEntry{{Table: "public.orders", Operations: []string{"select"}, Columns: []string{"id"}}}}}}
+	runtime, err := runtime.NewFromConfig(context.Background(), configuration, runtime.Dependencies{Catalog: explainCatalog{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime
 }
 
 type pingerFunc func(context.Context, string) error
