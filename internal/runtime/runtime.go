@@ -7,6 +7,7 @@ import (
 	"datawark/internal/execution"
 	"datawark/internal/policy"
 	"datawark/internal/postgres"
+	"datawark/internal/principal"
 	"datawark/internal/query"
 	"datawark/internal/schema"
 	"errors"
@@ -33,6 +34,20 @@ type Runtime struct {
 	configuration config.Config
 	snapshots     map[string]schema.Snapshot
 	executor      execution.Executor
+}
+
+// Gateway is a principal-bound runtime surface suitable for transport adapters.
+// It deliberately has no operation-level identity parameter.
+type Gateway interface {
+	Datasources() []string
+	Schema(string) (schema.Snapshot, error)
+	Execute(context.Context, query.Plan) (execution.Result, error)
+	Explain(query.Plan) policy.Explanation
+}
+
+type gateway struct {
+	runtime   *Runtime
+	principal principal.Trusted
 }
 
 // New loads configuration from path and builds a complete runtime. It returns
@@ -73,22 +88,45 @@ func NewFromConfig(ctx context.Context, configuration config.Config, dependencie
 	return &Runtime{configuration: configuration, snapshots: snapshots, executor: dependencies.Executor}, nil
 }
 
+// Bind returns a facade that performs all operations as one trusted principal.
+func (runtime *Runtime) Bind(identity principal.Trusted) (Gateway, error) {
+	if runtime == nil || !identity.Valid() {
+		return nil, errors.New("runtime: trusted principal is required")
+	}
+	return gateway{runtime: runtime, principal: identity}, nil
+}
+
+// LocalGateway binds the explicitly configured development principal for local
+// adapters such as MCP stdio. Network adapters must use Bind instead.
+func (runtime *Runtime) LocalGateway() (Gateway, error) {
+	if runtime == nil {
+		return nil, errors.New("runtime: trusted principal is required")
+	}
+	identity, err := principal.New(runtime.configuration.Server.DevelopmentPrincipal)
+	if err != nil {
+		return nil, errors.New("runtime: trusted principal is required")
+	}
+	return runtime.Bind(identity)
+}
+
 // Execute submits a plan to the existing complete query security pipeline.
-func (runtime *Runtime) Execute(ctx context.Context, plan query.Plan) (execution.Result, error) {
+func (gateway gateway) Execute(ctx context.Context, plan query.Plan) (execution.Result, error) {
+	runtime := gateway.runtime
 	snapshot, found := runtime.snapshot(plan.Source)
 	if !found {
 		return execution.Result{}, errors.New("runtime: datasource is unavailable")
 	}
-	service := execution.QueryService{Configuration: cloneConfig(runtime.configuration), Snapshot: snapshot, Executor: runtime.executor}
+	service := execution.QueryService{Configuration: cloneConfig(runtime.configuration), Snapshot: snapshot, Executor: runtime.executor, Principal: gateway.principal}
 	return service.Execute(ctx, plan)
 }
 
 // Datasources lists only sources with metadata visible to the configured principal.
-func (runtime *Runtime) Datasources() []string {
+func (gateway gateway) Datasources() []string {
+	runtime := gateway.runtime
 	visible := make([]string, 0)
 	for _, source := range runtime.configuration.Datasources {
 		snapshot, _ := runtime.snapshot(source.Name)
-		filtered, err := schema.Visible(runtime.configuration.Server.DevelopmentPrincipal, &runtime.configuration, &snapshot)
+		filtered, err := schema.Visible(gateway.principal.Name(), &runtime.configuration, &snapshot)
 		if err == nil && len(filtered.Relations()) > 0 {
 			visible = append(visible, source.Name)
 		}
@@ -97,21 +135,23 @@ func (runtime *Runtime) Datasources() []string {
 }
 
 // Schema returns only relations and columns visible to the configured principal.
-func (runtime *Runtime) Schema(datasource string) (schema.Snapshot, error) {
+func (gateway gateway) Schema(datasource string) (schema.Snapshot, error) {
+	runtime := gateway.runtime
 	snapshot, found := runtime.snapshot(datasource)
 	if !found {
 		return schema.Snapshot{}, errors.New("runtime: datasource is unavailable")
 	}
-	return schema.Visible(runtime.configuration.Server.DevelopmentPrincipal, &runtime.configuration, &snapshot)
+	return schema.Visible(gateway.principal.Name(), &runtime.configuration, &snapshot)
 }
 
 // Explain applies grammar, policy, and metadata gates without compiling or executing SQL.
-func (runtime *Runtime) Explain(plan query.Plan) policy.Explanation {
+func (gateway gateway) Explain(plan query.Plan) policy.Explanation {
+	runtime := gateway.runtime
 	validated, err := query.Validate(plan)
 	if err != nil {
 		return policy.Explanation{Reason: policy.ReasonDenied}
 	}
-	explanation := policy.Explain(policy.Input{Principal: runtime.configuration.Server.DevelopmentPrincipal, Snapshot: &runtime.configuration, Plan: validated})
+	explanation := policy.Explain(policy.Input{Principal: gateway.principal.Name(), Snapshot: &runtime.configuration, Plan: validated})
 	if !explanation.Allowed {
 		return explanation
 	}

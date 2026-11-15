@@ -28,7 +28,7 @@ type Dependencies struct {
 	Lookup  func(string) (string, bool)
 	Pinger  Pinger
 	Runtime func(context.Context, string) (*runtime.Runtime, error)
-	RunMCP  func(context.Context, *runtime.Runtime) error
+	RunMCP  func(context.Context, runtime.Gateway) error
 }
 
 func NewRootCommand(deps Dependencies) *cobra.Command {
@@ -65,7 +65,11 @@ func newMCPCommand(deps Dependencies) *cobra.Command {
 			if err != nil {
 				return errors.New("MCP runtime bootstrap failed")
 			}
-			return deps.RunMCP(cmd.Context(), runtime)
+			gateway, err := runtime.LocalGateway()
+			if err != nil {
+				return errors.New("MCP runtime bootstrap failed")
+			}
+			return deps.RunMCP(cmd.Context(), gateway)
 		},
 	}
 	stdio.Flags().StringVar(&path, "config", "", "path to configuration YAML")

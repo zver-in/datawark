@@ -6,6 +6,7 @@ import (
 	"datawark/internal/config"
 	"datawark/internal/execution"
 	"datawark/internal/postgres"
+	"datawark/internal/principal"
 	"datawark/internal/query"
 	"datawark/internal/schema"
 	"errors"
@@ -47,10 +48,14 @@ func TestNewBootstrapsCompleteImmutableRuntime(t *testing.T) {
 	cfg.Policies[0].Allow[0].Columns[0] = "secret"
 	firstRelations := first.Relations()
 	firstRelations[0] = schema.NewRelation("public", "other", nil)
-	if got := runtime.Datasources(); len(got) != 1 || got[0] != "primary" {
+	local, err := runtime.LocalGateway()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := local.Datasources(); len(got) != 1 || got[0] != "primary" {
 		t.Fatalf("datasources = %v", got)
 	}
-	visible, err := runtime.Schema("primary")
+	visible, err := local.Schema("primary")
 	if err != nil || len(visible.Relations()) != 1 || len(visible.Relations()[0].Columns()) != 1 {
 		t.Fatalf("schema = %#v, %v", visible, err)
 	}
@@ -87,27 +92,70 @@ func TestRuntimeOperationsNeverExecuteRejectedPlans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	local, err := runtime.LocalGateway()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, plan := range []query.Plan{
 		{Source: "unknown", Table: "public.orders", Projection: []string{"id"}, Limit: 1},
 		{Source: "primary", Table: "public.orders", Projection: []string{"secret"}, Limit: 1},
 		{Source: "primary", Table: "public.missing", Projection: []string{"id"}, Limit: 1},
 	} {
-		if _, err := runtime.Execute(context.Background(), plan); err == nil {
+		if _, err := local.Execute(context.Background(), plan); err == nil {
 			t.Fatalf("plan accepted: %#v", plan)
 		}
 	}
 	if executor.calls != 0 {
 		t.Fatalf("executor calls = %d", executor.calls)
 	}
-	if explanation := runtime.Explain(query.Plan{Source: "primary", Table: "public.orders", Projection: []string{"id"}, Limit: 1}); !explanation.Allowed {
+	if explanation := local.Explain(query.Plan{Source: "primary", Table: "public.orders", Projection: []string{"id"}, Limit: 1}); !explanation.Allowed {
 		t.Fatalf("explanation = %#v", explanation)
 	}
-	if explanation := runtime.Explain(query.Plan{Source: "primary", Table: "public.missing", Projection: []string{"id"}, Limit: 1}); explanation.Allowed {
+	if explanation := local.Explain(query.Plan{Source: "primary", Table: "public.missing", Projection: []string{"id"}, Limit: 1}); explanation.Allowed {
 		t.Fatalf("stale explanation = %#v", explanation)
 	}
 	if executor.calls != 0 {
 		t.Fatalf("explain executed: %d", executor.calls)
 	}
+}
+
+func TestTrustedPrincipalBindingIsStableAndLocalIsExplicit(t *testing.T) {
+	if _, err := principal.New(" "); err == nil {
+		t.Fatal("empty principal was accepted")
+	}
+	configuration := testConfig()
+	configuration.Policies = append(configuration.Policies, config.Policy{Name: "reader", Principals: []string{"reader"}, Datasource: "primary", Allow: []config.AllowEntry{{Table: "public.orders", Operations: []string{"select"}, Columns: []string{"id", "secret"}}}})
+	runtime, err := NewFromConfig(context.Background(), configuration, Dependencies{Catalog: catalogFake{snapshots: map[string]schema.Snapshot{"primary": schema.NewSnapshot("primary", []schema.Relation{schema.NewRelation("public", "orders", []schema.Column{{Name: "id"}, {Name: "secret"}})}), "reporting": schema.NewSnapshot("reporting", nil)}}, Executor: &executorFake{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	developer, err := runtime.LocalGateway()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := runtime.Bind(mustPrincipal(t, "reader"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := query.Plan{Source: "primary", Table: "public.orders", Projection: []string{"secret"}, Limit: 1}
+	if _, err := developer.Execute(context.Background(), plan); err == nil {
+		t.Fatal("developer binding accepted reader-only column")
+	}
+	if _, err := reader.Execute(context.Background(), plan); err != nil {
+		t.Fatalf("reader binding = %v", err)
+	}
+	if _, err := runtime.Bind(principal.Trusted{}); err == nil {
+		t.Fatal("zero principal was bound")
+	}
+}
+
+func mustPrincipal(t *testing.T, name string) principal.Trusted {
+	t.Helper()
+	identity, err := principal.New(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }
 
 func testConfig() config.Config {

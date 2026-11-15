@@ -6,6 +6,7 @@ import (
 	"datawark/internal/compiler"
 	"datawark/internal/config"
 	"datawark/internal/policy"
+	"datawark/internal/principal"
 	"datawark/internal/query"
 	"datawark/internal/schema"
 	"errors"
@@ -48,15 +49,19 @@ type QueryService struct {
 	Snapshot      schema.Snapshot
 	Executor      Executor
 	Compile       func(policy.AuthorizedQuery) (compiler.Statement, error)
+	Principal     principal.Trusted
 }
 
 func (service QueryService) Execute(ctx context.Context, plan query.Plan) (Result, error) {
+	if !service.Principal.Valid() {
+		return Result{}, errors.New("trusted principal is required")
+	}
 	validated, err := query.Validate(plan)
 	if err != nil {
 		return Result{}, err
 	}
 	authorized, err := policy.Authorize(policy.Input{
-		Principal: service.Configuration.Server.DevelopmentPrincipal,
+		Principal: service.Principal.Name(),
 		Snapshot:  &service.Configuration,
 		Plan:      validated,
 	})

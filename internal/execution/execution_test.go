@@ -5,6 +5,7 @@ import (
 	"datawark/internal/compiler"
 	"datawark/internal/config"
 	"datawark/internal/policy"
+	"datawark/internal/principal"
 	"datawark/internal/query"
 	"datawark/internal/schema"
 	"errors"
@@ -16,10 +17,10 @@ import (
 func TestQueryServiceStopsBeforeExecutorForEachFailedGate(t *testing.T) {
 	valid := testPlan()
 	for name, service := range map[string]QueryService{
-		"validation": {Configuration: testConfig(), Snapshot: testSnapshot(), Executor: &recordingExecutor{}},
-		"policy":     {Configuration: config.Config{}, Snapshot: testSnapshot(), Executor: &recordingExecutor{}},
-		"schema":     {Configuration: testConfig(), Snapshot: schema.NewSnapshot("analytics", nil), Executor: &recordingExecutor{}},
-		"compile": {Configuration: testConfig(), Snapshot: testSnapshot(), Executor: &recordingExecutor{}, Compile: func(policy.AuthorizedQuery) (compiler.Statement, error) {
+		"validation": {Configuration: testConfig(), Snapshot: testSnapshot(), Executor: &recordingExecutor{}, Principal: trusted(t, "reader")},
+		"policy":     {Configuration: config.Config{}, Snapshot: testSnapshot(), Executor: &recordingExecutor{}, Principal: trusted(t, "reader")},
+		"schema":     {Configuration: testConfig(), Snapshot: schema.NewSnapshot("analytics", nil), Executor: &recordingExecutor{}, Principal: trusted(t, "reader")},
+		"compile": {Configuration: testConfig(), Snapshot: testSnapshot(), Executor: &recordingExecutor{}, Principal: trusted(t, "reader"), Compile: func(policy.AuthorizedQuery) (compiler.Statement, error) {
 			return compiler.Statement{}, errors.New("compile failed")
 		}},
 	} {
@@ -41,10 +42,22 @@ func TestQueryServiceStopsBeforeExecutorForEachFailedGate(t *testing.T) {
 
 func TestQueryServiceExecutesOnlyAfterAllGates(t *testing.T) {
 	executor := &recordingExecutor{result: Result{Columns: []string{"id"}, Rows: [][]any{{1}}}}
-	service := QueryService{Configuration: testConfig(), Snapshot: testSnapshot(), Executor: executor}
+	service := QueryService{Configuration: testConfig(), Snapshot: testSnapshot(), Executor: executor, Principal: trusted(t, "reader")}
 	result, err := service.Execute(context.Background(), testPlan())
 	if err != nil || !executor.called || !reflect.DeepEqual(result, executor.result) {
 		t.Fatalf("Execute() = %#v, %v", result, err)
+	}
+}
+
+func TestQueryServiceRejectsMissingPrincipalBeforeCompilationAndExecution(t *testing.T) {
+	called := false
+	executor := &recordingExecutor{}
+	service := QueryService{Configuration: testConfig(), Snapshot: testSnapshot(), Executor: executor, Compile: func(policy.AuthorizedQuery) (compiler.Statement, error) {
+		called = true
+		return compiler.Statement{}, nil
+	}}
+	if _, err := service.Execute(context.Background(), testPlan()); err == nil || called || executor.called {
+		t.Fatalf("err=%v compiled=%v executed=%v", err, called, executor.called)
 	}
 }
 
@@ -83,4 +96,13 @@ func testConfig() config.Config {
 }
 func testSnapshot() schema.Snapshot {
 	return schema.NewSnapshot("analytics", []schema.Relation{schema.NewRelation("public", "orders", []schema.Column{{Name: "id"}, {Name: "note", Nullable: true}})})
+}
+
+func trusted(t *testing.T, name string) principal.Trusted {
+	t.Helper()
+	identity, err := principal.New(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }

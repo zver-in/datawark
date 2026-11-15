@@ -12,6 +12,7 @@ import (
 
 	"datawark/internal/config"
 	"datawark/internal/runtime"
+	"datawark/internal/schema"
 	"github.com/spf13/cobra"
 )
 
@@ -76,8 +77,8 @@ func TestSourceTestFailuresAreSafe(t *testing.T) {
 func TestMCPStdioBootstrapsBeforeServingAndKeepsErrorsOffStdout(t *testing.T) {
 	var started bool
 	command := NewRootCommand(Dependencies{
-		Runtime: func(context.Context, string) (*runtime.Runtime, error) { return &runtime.Runtime{}, nil },
-		RunMCP:  func(context.Context, *runtime.Runtime) error { started = true; return nil },
+		Runtime: func(context.Context, string) (*runtime.Runtime, error) { return mcpRuntime(t), nil },
+		RunMCP:  func(context.Context, runtime.Gateway) error { started = true; return nil },
 	})
 	if output, err := run(command, "mcp", "stdio", "--config", "gateway.yaml"); err != nil || output != "" || !started {
 		t.Fatalf("output=%q err=%v started=%v", output, err, started)
@@ -86,7 +87,7 @@ func TestMCPStdioBootstrapsBeforeServingAndKeepsErrorsOffStdout(t *testing.T) {
 	started = false
 	command = NewRootCommand(Dependencies{
 		Runtime: func(context.Context, string) (*runtime.Runtime, error) { return nil, errors.New("secret") },
-		RunMCP:  func(context.Context, *runtime.Runtime) error { started = true; return nil },
+		RunMCP:  func(context.Context, runtime.Gateway) error { started = true; return nil },
 	})
 	var stdout, stderr bytes.Buffer
 	command.SetOut(&stdout)
@@ -95,6 +96,22 @@ func TestMCPStdioBootstrapsBeforeServingAndKeepsErrorsOffStdout(t *testing.T) {
 	if err := command.Execute(); err == nil || started || stdout.Len() != 0 || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("stdout=%q err=%v started=%v", stdout.String(), err, started)
 	}
+}
+
+type mcpCatalog struct{}
+
+func (mcpCatalog) Load(context.Context, config.Config, string) (schema.Snapshot, error) {
+	return schema.NewSnapshot("analytics", nil), nil
+}
+
+func mcpRuntime(t *testing.T) *runtime.Runtime {
+	t.Helper()
+	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "local-dev"}, Datasources: []config.Datasource{{Name: "analytics", Driver: "postgres", DSNEnv: "TEST_DSN"}}}
+	runtime, err := runtime.NewFromConfig(context.Background(), configuration, runtime.Dependencies{Catalog: mcpCatalog{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runtime
 }
 
 func TestMCPStdioProcessKeepsDiagnosticsOffStdout(t *testing.T) {

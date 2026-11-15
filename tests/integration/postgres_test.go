@@ -20,6 +20,7 @@ import (
 	"datawark/internal/execution"
 	"datawark/internal/mcpserver"
 	pgadapter "datawark/internal/postgres"
+	"datawark/internal/principal"
 	"datawark/internal/query"
 	gatewayruntime "datawark/internal/runtime"
 	"datawark/internal/schema"
@@ -116,7 +117,11 @@ func TestMCPQueryUsesSharedRuntimePipeline(t *testing.T) {
 		t.Fatal(err)
 	}
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	serverSession, err := mcpserver.New(runtime).Connect(context.Background(), serverTransport, nil)
+	local, err := runtime.LocalGateway()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverSession, err := mcpserver.New(local).Connect(context.Background(), serverTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +158,11 @@ func TestRuntimeBootstrapIsAllOrNothing(t *testing.T) {
 	if err != nil || runtime == nil {
 		t.Fatalf("multi-datasource bootstrap = %v, %v", runtime, err)
 	}
-	if got := runtime.Datasources(); len(got) != 2 || got[0] != "primary" || got[1] != "replica" {
+	local, err := runtime.LocalGateway()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := local.Datasources(); len(got) != 2 || got[0] != "primary" || got[1] != "replica" {
 		t.Fatalf("visible datasources = %v", got)
 	}
 
@@ -193,7 +202,7 @@ func TestReadOnlyQueryExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := execution.QueryService{Configuration: configuration, Snapshot: snapshot, Executor: pgadapter.NewExecutor()}
+	service := execution.QueryService{Configuration: configuration, Snapshot: snapshot, Executor: pgadapter.NewExecutor(), Principal: trusted(t, "local-dev")}
 	result, err := service.Execute(context.Background(), query.Plan{Source: "test_postgres", Table: "public.read_only_query_fixture", Projection: []string{"id", "note"}, Limit: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -221,7 +230,7 @@ func TestQueryServiceRejectsWriteAndDDLShapes(t *testing.T) {
 	snapshot := schema.NewSnapshot("test_postgres", []schema.Relation{schema.NewRelation("public", "read_only_query_fixture", []schema.Column{{Name: "id"}})})
 	for _, table := range []string{"public.read_only_query_fixture; INSERT INTO x VALUES (1)", "public.read_only_query_fixture; UPDATE x SET id = 1", "public.read_only_query_fixture; DELETE FROM x", "public.read_only_query_fixture; DROP TABLE x"} {
 		executor := &countingExecutor{}
-		service := execution.QueryService{Configuration: configuration, Snapshot: snapshot, Executor: executor}
+		service := execution.QueryService{Configuration: configuration, Snapshot: snapshot, Executor: executor, Principal: trusted(t, "local-dev")}
 		if _, err := service.Execute(context.Background(), query.Plan{Source: "test_postgres", Table: table, Projection: []string{"id"}, Limit: 1}); err == nil || executor.calls != 0 {
 			t.Fatalf("write shape reached executor: %q", table)
 		}
@@ -314,7 +323,20 @@ func runtimeService(runtime config.Runtime) execution.QueryService {
 		schema.NewRelation("public", "runtime_guard_fixture", []schema.Column{{Name: "id"}, {Name: "note"}}),
 		schema.NewRelation("public", "runtime_guard_sleep", []schema.Column{{Name: "id"}}),
 	})
-	return execution.QueryService{Configuration: configuration, Snapshot: snapshot, Executor: pgadapter.NewExecutor()}
+	return execution.QueryService{Configuration: configuration, Snapshot: snapshot, Executor: pgadapter.NewExecutor(), Principal: trustedPrincipal("local-dev")}
+}
+
+func trusted(t *testing.T, name string) principal.Trusted {
+	t.Helper()
+	return trustedPrincipal(name)
+}
+
+func trustedPrincipal(name string) principal.Trusted {
+	identity, err := principal.New(name)
+	if err != nil {
+		panic(err)
+	}
+	return identity
 }
 
 func readOnlyConfig() config.Config {

@@ -4,11 +4,8 @@ package mcpserver
 import (
 	"bytes"
 	"context"
-	"datawark/internal/execution"
-	"datawark/internal/policy"
 	"datawark/internal/query"
 	"datawark/internal/runtime"
-	"datawark/internal/schema"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,12 +14,7 @@ import (
 )
 
 // Gateway is the deliberately small runtime surface exposed to MCP tools.
-type Gateway interface {
-	Datasources() []string
-	Schema(string) (schema.Snapshot, error)
-	Execute(context.Context, query.Plan) (execution.Result, error)
-	Explain(query.Plan) policy.Explanation
-}
+type Gateway = runtime.Gateway
 
 // New constructs an MCP server with precisely the supported data tools.
 func New(gateway Gateway) *mcp.Server {
@@ -34,7 +26,7 @@ func New(gateway Gateway) *mcp.Server {
 }
 
 // Run serves the constructed server over the process stdin and stdout only.
-func Run(ctx context.Context, gateway *runtime.Runtime) error {
+func Run(ctx context.Context, gateway Gateway) error {
 	if gateway == nil {
 		return errors.New("MCP runtime is unavailable")
 	}
