@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"datawark/internal/audit"
 	"datawark/internal/config"
 )
 
@@ -18,6 +20,36 @@ func TestServerUsesBoundedHTTPSettings(t *testing.T) {
 	if service.server.ReadHeaderTimeout != ReadHeaderTimeout || service.server.IdleTimeout != IdleTimeout || service.server.MaxHeaderBytes != MaxHeaderBytes {
 		t.Fatalf("server limits = %#v", service.server)
 	}
+}
+
+func TestAuthenticationWritesOneEventAndFailsClosedOnAuditFailure(t *testing.T) {
+	secret := "reader-key"
+	authenticator, err := NewAuthenticator([]config.APIKey{{Principal: "reader", KeyEnv: "READER_KEY"}}, func(string) (string, bool) { return secret, true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events bytes.Buffer
+	authenticator.SetRecorder(audit.NewJSONLinesRecorder(&events))
+	service := New("127.0.0.1:0")
+	handler := service.requestID(authenticator.middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})))
+	request := httptest.NewRequest(http.MethodGet, "/data", nil)
+	request.Header.Set("Authorization", "Bearer "+secret)
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+	if strings.Count(events.String(), "\n") != 1 || !strings.Contains(events.String(), "\"operation\":\"authenticate\"") {
+		t.Fatalf("events = %q", events.String())
+	}
+	authenticator.SetRecorder(audit.NewJSONLinesRecorder(failingAuditWriter{}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d", response.Code)
+	}
+}
+
+type failingAuditWriter struct{}
+
+func (failingAuditWriter) Write([]byte) (int, error) {
+	return 0, errors.New("audit writer unavailable")
 }
 
 func TestAuthenticatorBootstrapIsSecretSafe(t *testing.T) {

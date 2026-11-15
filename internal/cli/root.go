@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"datawark/internal/audit"
 	"datawark/internal/config"
 	"datawark/internal/httpserver"
 	"datawark/internal/mcpserver"
@@ -102,6 +103,7 @@ func newServeCommand(deps Dependencies) *cobra.Command {
 			if err != nil || authenticator == nil {
 				return errors.New("HTTP authentication bootstrap failed")
 			}
+			authenticator.SetRecorder(audit.NewJSONLinesRecorder(cmd.OutOrStdout()))
 			listener, err := deps.Listen("tcp", configuration.Server.HTTPListener().ListenAddress)
 			if err != nil {
 				return errors.New("HTTP listener could not be started")

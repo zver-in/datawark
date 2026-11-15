@@ -8,7 +8,9 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
+	"datawark/internal/audit"
 	"datawark/internal/config"
 	"datawark/internal/principal"
 )
@@ -27,7 +29,15 @@ type credential struct {
 }
 
 // Authenticator keeps only SHA-256 digests after bootstrap.
-type Authenticator struct{ credentials []credential }
+type Authenticator struct {
+	credentials []credential
+	recorder    audit.Recorder
+}
+
+// SetRecorder configures the synchronous HTTP audit boundary.
+func (authenticator *Authenticator) SetRecorder(recorder audit.Recorder) {
+	authenticator.recorder = recorder
+}
 
 // NewAuthenticator resolves all configured secrets before the listener is
 // created. Errors deliberately identify only configuration categories.
@@ -92,13 +102,29 @@ func (authenticator *Authenticator) middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(writer, request)
 			return
 		}
+		started := time.Now()
 		identity, ok := authenticator.Authenticate(request.Header)
+		event := audit.Event{Version: audit.VersionV1Alpha1, Timestamp: started.UTC(), RequestID: RequestID(request.Context()), Transport: audit.TransportREST, Operation: audit.OperationAuthenticate, DurationMS: time.Since(started).Milliseconds()}
 		if !ok {
+			event.Outcome, event.Reason = audit.OutcomeDenied, audit.ReasonAuthentication
+			if !authenticator.record(event) {
+				unavailable(writer, request)
+				return
+			}
 			unauthorized(writer, request)
+			return
+		}
+		event.Principal, event.Outcome, event.Reason = identity.Name(), audit.OutcomeSuccess, audit.ReasonNone
+		if !authenticator.record(event) {
+			unavailable(writer, request)
 			return
 		}
 		next.ServeHTTP(writer, request.WithContext(context.WithValue(request.Context(), principalContextKey{}, identity)))
 	})
+}
+
+func (authenticator *Authenticator) record(event audit.Event) bool {
+	return authenticator.recorder == nil || authenticator.recorder.Record(event) == nil
 }
 
 func operationalPath(path string) bool {
@@ -113,4 +139,13 @@ func unauthorized(writer http.ResponseWriter, request *http.Request) {
 		Error     string `json:"error"`
 		RequestID string `json:"requestId"`
 	}{Error: "unauthorized", RequestID: RequestID(request.Context())})
+}
+
+func unavailable(writer http.ResponseWriter, request *http.Request) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(writer).Encode(struct {
+		Error     string `json:"error"`
+		RequestID string `json:"requestId"`
+	}{Error: "unavailable", RequestID: RequestID(request.Context())})
 }

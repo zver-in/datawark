@@ -2,15 +2,15 @@
 
 ## 1. Audit contract and writer
 
-- [ ] 1.1 Define the v1alpha1 audit event enums and typed fields for HTTP authentication and HTTP schema, explain, and query operations; verify schema tests reject invalid combinations and JSON snapshots contain only documented fields.
-- [ ] 1.2 Implement a concurrency-safe JSON-lines recorder over an injected writer; verify concurrent tests produce one complete line per event with deterministic field encoding and no interleaving.
-- [ ] 1.3 Add hostile-value redaction tests covering API keys, digests, authorization headers, DSNs, SQL, arguments, rows, bodies, hidden resources, and raw errors; verify none appear in serialized events or recorder failures.
+- [x] 1.1 Define the v1alpha1 audit event enums and typed fields for HTTP authentication and HTTP schema, explain, and query operations; verify schema tests reject invalid combinations and JSON snapshots contain only documented fields.
+- [x] 1.2 Implement a concurrency-safe JSON-lines recorder over an injected writer; verify concurrent tests produce one complete line per event with deterministic field encoding and no interleaving.
+- [x] 1.3 Add hostile-value redaction tests covering API keys, digests, authorization headers, DSNs, SQL, arguments, rows, bodies, hidden resources, and raw errors; verify none appear in serialized events or recorder failures.
 
 ## 2. Terminal event orchestration
 
-- [ ] 2.1 Add safe outcome classification for authentication, policy, validation, metadata, guardrail, execution, and unavailable failures; verify every existing stable failure maps to a bounded audit reason without raw error text.
-- [ ] 2.2 Implement one-owner authentication finalization that emits exactly one event for success or failure; verify audit write failure changes the HTTP outcome to unavailable and never duplicates an event.
-- [ ] 2.3 Implement a reusable audited-operation wrapper for HTTP schema, explain, and query handlers; verify success is not committed before handoff, failure outcomes are recorded once, and successful data is discarded on writer failure.
+- [x] 2.1 Add safe outcome classification for authentication, policy, validation, metadata, guardrail, execution, and unavailable failures; verify every existing stable failure maps to a bounded audit reason without raw error text.
+- [x] 2.2 Implement one-owner authentication finalization that emits exactly one event for success or failure; verify audit write failure changes the HTTP outcome to unavailable and never duplicates an event.
+- [x] 2.3 Implement a reusable audited-operation wrapper for HTTP schema, explain, and query handlers; verify success is not committed before handoff, failure outcomes are recorded once, and successful data is discarded on writer failure.
 
 ## 3. Process integration
 
