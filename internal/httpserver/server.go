@@ -36,15 +36,19 @@ type Server struct {
 	ready  atomic.Bool
 }
 
-func New(address string) *Server {
+func New(address string, authenticators ...*Authenticator) *Server {
 	service := &Server{}
 	router := chi.NewRouter()
-	router.Use(service.requestID)
 	router.Get("/api/v1/health", service.health)
 	router.Get("/api/v1/ready", service.readiness)
+	var handler http.Handler = router
+	if len(authenticators) == 1 && authenticators[0] != nil {
+		handler = authenticators[0].middleware(handler)
+	}
+	handler = service.requestID(handler)
 	service.server = &http.Server{
 		Addr:              address,
-		Handler:           router,
+		Handler:           handler,
 		ReadHeaderTimeout: ReadHeaderTimeout,
 		IdleTimeout:       IdleTimeout,
 		WriteTimeout:      WriteTimeout,

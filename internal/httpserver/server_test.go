@@ -9,12 +9,109 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"datawark/internal/config"
 )
 
 func TestServerUsesBoundedHTTPSettings(t *testing.T) {
 	service := New("127.0.0.1:0")
 	if service.server.ReadHeaderTimeout != ReadHeaderTimeout || service.server.IdleTimeout != IdleTimeout || service.server.MaxHeaderBytes != MaxHeaderBytes {
 		t.Fatalf("server limits = %#v", service.server)
+	}
+}
+
+func TestAuthenticatorBootstrapIsSecretSafe(t *testing.T) {
+	secret := "distinctive-bootstrap-secret"
+	keys := []config.APIKey{{Principal: "reader", KeyEnv: "READER_KEY"}, {Principal: "writer", KeyEnv: "WRITER_KEY"}}
+	authenticator, err := NewAuthenticator(keys, func(name string) (string, bool) {
+		return map[string]string{"READER_KEY": secret, "WRITER_KEY": "other-secret"}[name], true
+	})
+	if err != nil || authenticator == nil || len(authenticator.credentials) != 2 {
+		t.Fatalf("NewAuthenticator() = %#v, %v", authenticator, err)
+	}
+	for _, test := range []struct {
+		name   string
+		keys   []config.APIKey
+		lookup func(string) (string, bool)
+	}{
+		{"missing", keys[:1], func(string) (string, bool) { return "", false }},
+		{"empty", keys[:1], func(string) (string, bool) { return "", true }},
+		{"duplicate", keys, func(string) (string, bool) { return secret, true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := NewAuthenticator(test.keys, test.lookup)
+			if err == nil || strings.Contains(err.Error(), secret) {
+				t.Fatalf("unsafe bootstrap error: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuthenticatedRoutesFailClosedAndExposeTrustedPrincipal(t *testing.T) {
+	secret := "hostile-secret-value"
+	authenticator, err := NewAuthenticator([]config.APIKey{{Principal: "reader", KeyEnv: "READER_KEY"}}, func(string) (string, bool) { return secret, true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New("127.0.0.1:0", authenticator)
+	protected := authenticator.middleware(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		identity, ok := Principal(request.Context())
+		if !ok || identity.Name() != "reader" || request.URL.Query().Get("principal") == identity.Name() {
+			t.Fatalf("trusted identity = %#v, %v", identity, ok)
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	for name, header := range map[string][]string{
+		"missing": nil, "malformed": {"Basic " + secret}, "multiple": {"Bearer " + secret, "Bearer " + secret}, "unknown": {"Bearer unknown"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/data", nil)
+			request.Header["Authorization"] = header
+			response := httptest.NewRecorder()
+			protected.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized || response.Header().Get("WWW-Authenticate") != "Bearer" || strings.Contains(response.Body.String(), secret) {
+				t.Fatalf("response = %d %q", response.Code, response.Body.String())
+			}
+		})
+	}
+	request := httptest.NewRequest(http.MethodGet, "/data?principal=writer", nil)
+	request.Header.Set("Authorization", "bEaReR "+secret)
+	response := httptest.NewRecorder()
+	protected.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("authenticated status = %d", response.Code)
+	}
+	for _, path := range []string{"/api/v1/health", "/api/v1/ready", "/metrics"} {
+		response = httptest.NewRecorder()
+		service.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code == http.StatusUnauthorized {
+			t.Fatalf("operational route %s required authentication", path)
+		}
+	}
+	response = httptest.NewRecorder()
+	service.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/unknown", nil))
+	if response.Code != http.StatusUnauthorized || response.Header().Get("WWW-Authenticate") != "Bearer" {
+		t.Fatalf("anonymous unknown route = %d", response.Code)
+	}
+}
+
+func TestAuthenticatorKeepsAPIKeyPrincipalsIsolated(t *testing.T) {
+	authenticator, err := NewAuthenticator([]config.APIKey{
+		{Principal: "reader", KeyEnv: "READER_KEY"},
+		{Principal: "auditor", KeyEnv: "AUDITOR_KEY"},
+	}, func(name string) (string, bool) {
+		return map[string]string{"READER_KEY": "reader-key", "AUDITOR_KEY": "auditor-key"}[name], true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for credential, want := range map[string]string{"reader-key": "reader", "auditor-key": "auditor"} {
+		request := httptest.NewRequest(http.MethodGet, "/api/v1/query?principal=attacker", nil)
+		request.Header.Set("Authorization", "Bearer "+credential)
+		identity, ok := authenticator.Authenticate(request.Header)
+		if !ok || identity.Name() != want {
+			t.Fatalf("Authenticate(%q) = %q, %v; want %q", credential, identity.Name(), ok, want)
+		}
 	}
 }
 

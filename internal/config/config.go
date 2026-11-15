@@ -40,7 +40,15 @@ type Server struct {
 
 // HTTP configures the single Gateway HTTP listener.
 type HTTP struct {
-	ListenAddress string `yaml:"listenAddress"`
+	ListenAddress string   `yaml:"listenAddress"`
+	APIKeys       []APIKey `yaml:"apiKeys"`
+}
+
+// APIKey maps a policy principal to the environment variable holding its key.
+// The key value itself is deliberately never part of configuration.
+type APIKey struct {
+	Principal string `yaml:"principal"`
+	KeyEnv    string `yaml:"keyEnv"`
 }
 
 func DefaultHTTP() HTTP { return HTTP{ListenAddress: DefaultHTTPListenAddress} }
@@ -180,13 +188,14 @@ func unknownFieldViolation(document *yaml.Node) *Violation {
 		return &Violation{Path: "configuration", Message: "must be a mapping"}
 	}
 	return checkMapping(document.Content[0], "", map[string]map[string]struct{}{
-		"":                   fieldSet("version", "server", "datasources", "policies"),
-		"server":             fieldSet("developmentPrincipal", "runtime", "http"),
-		"server.runtime":     fieldSet("statementTimeout", "maxRows", "maxResultBytes", "maxConcurrentQueries"),
-		"server.http":        fieldSet("listenAddress"),
-		"datasources[]":      fieldSet("name", "driver", "dsnEnv"),
-		"policies[]":         fieldSet("name", "principals", "datasource", "allow"),
-		"policies[].allow[]": fieldSet("table", "operations", "columns"),
+		"":                      fieldSet("version", "server", "datasources", "policies"),
+		"server":                fieldSet("developmentPrincipal", "runtime", "http"),
+		"server.runtime":        fieldSet("statementTimeout", "maxRows", "maxResultBytes", "maxConcurrentQueries"),
+		"server.http":           fieldSet("listenAddress", "apiKeys"),
+		"server.http.apiKeys[]": fieldSet("principal", "keyEnv"),
+		"datasources[]":         fieldSet("name", "driver", "dsnEnv"),
+		"policies[]":            fieldSet("name", "principals", "datasource", "allow"),
+		"policies[].allow[]":    fieldSet("table", "operations", "columns"),
 	})
 }
 
@@ -215,6 +224,12 @@ func checkMapping(node *yaml.Node, path string, allowed map[string]map[string]st
 			if violation := checkMapping(value, childPath, allowed); violation != nil {
 				return violation
 			}
+		case "server.http.apiKeys":
+			for index, item := range value.Content {
+				if violation := checkMapping(item, fmt.Sprintf("server.http.apiKeys[%d]", index), allowed); violation != nil {
+					return violation
+				}
+			}
 		case "datasources":
 			for index, item := range value.Content {
 				if violation := checkMapping(item, fmt.Sprintf("datasources[%d]", index), allowed); violation != nil {
@@ -242,6 +257,9 @@ func checkMapping(node *yaml.Node, path string, allowed map[string]map[string]st
 func mappingPath(path string) string {
 	if strings.HasPrefix(path, "datasources[") {
 		return "datasources[]"
+	}
+	if strings.HasPrefix(path, "server.http.apiKeys[") {
+		return "server.http.apiKeys[]"
 	}
 	if strings.HasPrefix(path, "policies[") && strings.Contains(path, ".allow[") {
 		return "policies[].allow[]"
@@ -286,6 +304,27 @@ func Validate(cfg Config) error {
 	if http := cfg.Server.HTTP; http != nil {
 		if !validListenAddress(http.ListenAddress) {
 			add("server.http.listenAddress", "must be a valid host and port")
+		}
+		principals := make(map[string]struct{}, len(http.APIKeys))
+		keyEnvs := make(map[string]struct{}, len(http.APIKeys))
+		for i, key := range http.APIKeys {
+			prefix := fmt.Sprintf("server.http.apiKeys[%d]", i)
+			principal := strings.TrimSpace(key.Principal)
+			if principal == "" {
+				add(prefix+".principal", "is required")
+			} else if _, exists := principals[principal]; exists {
+				add(prefix+".principal", "must be unique")
+			} else {
+				principals[principal] = struct{}{}
+			}
+			keyEnv := strings.TrimSpace(key.KeyEnv)
+			if keyEnv == "" {
+				add(prefix+".keyEnv", "is required")
+			} else if _, exists := keyEnvs[keyEnv]; exists {
+				add(prefix+".keyEnv", "must be unique")
+			} else {
+				keyEnvs[keyEnv] = struct{}{}
+			}
 		}
 	}
 

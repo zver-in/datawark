@@ -5,6 +5,10 @@ server:
   # Defaults to 127.0.0.1:8080; keep loopback until HTTP authentication is configured.
   http:
     listenAddress: 127.0.0.1:8080
+    apiKeys:
+      # Set DATAWARK_LOCAL_API_KEY in the server environment; no key belongs in YAML.
+      - principal: local-dev
+        keyEnv: DATAWARK_LOCAL_API_KEY
   runtime:
     statementTimeout: 5s
     maxRows: 1000

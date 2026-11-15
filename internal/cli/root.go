@@ -38,7 +38,8 @@ type Dependencies struct {
 	RunMCP    func(context.Context, runtime.Gateway) error
 	Bootstrap Bootstrap
 	Listen    ListenerFactory
-	NewHTTP   func(string) *httpserver.Server
+	NewHTTP   func(string, *httpserver.Authenticator) *httpserver.Server
+	NewAuth   func([]config.APIKey, func(string) (string, bool)) (*httpserver.Authenticator, error)
 }
 
 func NewRootCommand(deps Dependencies) *cobra.Command {
@@ -73,7 +74,12 @@ func NewRootCommand(deps Dependencies) *cobra.Command {
 		deps.Listen = net.Listen
 	}
 	if deps.NewHTTP == nil {
-		deps.NewHTTP = httpserver.New
+		deps.NewHTTP = func(address string, authenticator *httpserver.Authenticator) *httpserver.Server {
+			return httpserver.New(address, authenticator)
+		}
+	}
+	if deps.NewAuth == nil {
+		deps.NewAuth = httpserver.NewAuthenticator
 	}
 
 	root := &cobra.Command{Use: "datawark", SilenceUsage: true, SilenceErrors: true}
@@ -92,11 +98,15 @@ func newServeCommand(deps Dependencies) *cobra.Command {
 			if err != nil || gateway == nil {
 				return errors.New("HTTP runtime bootstrap failed")
 			}
+			authenticator, err := deps.NewAuth(configuration.Server.HTTPListener().APIKeys, deps.Lookup)
+			if err != nil || authenticator == nil {
+				return errors.New("HTTP authentication bootstrap failed")
+			}
 			listener, err := deps.Listen("tcp", configuration.Server.HTTPListener().ListenAddress)
 			if err != nil {
 				return errors.New("HTTP listener could not be started")
 			}
-			service := deps.NewHTTP(configuration.Server.HTTPListener().ListenAddress)
+			service := deps.NewHTTP(configuration.Server.HTTPListener().ListenAddress, authenticator)
 			serveErrors := make(chan error, 1)
 			go func() { serveErrors <- service.Serve(listener) }()
 			select {

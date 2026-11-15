@@ -45,7 +45,7 @@ func TestParseValidFixture(t *testing.T) {
 	if got := cfg.Server.RuntimeLimits(); got != DefaultRuntime() {
 		t.Fatalf("runtime defaults = %#v", got)
 	}
-	if got := cfg.Server.HTTPListener(); got != DefaultHTTP() {
+	if got := cfg.Server.HTTPListener(); got.ListenAddress != DefaultHTTP().ListenAddress || len(got.APIKeys) != 0 {
 		t.Fatalf("HTTP defaults = %#v", got)
 	}
 }
@@ -67,6 +67,38 @@ func TestParseHTTPListener(t *testing.T) {
 			_, err := Parse([]byte(data))
 			if err == nil || !strings.Contains(err.Error(), "server.http") || strings.Contains(err.Error(), "secret") {
 				t.Fatalf("unsafe HTTP error: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseHTTPAPIKeys(t *testing.T) {
+	t.Parallel()
+	base := "version: v1alpha1\nserver:\n  developmentPrincipal: reader\n  http:\n    listenAddress: 127.0.0.1:9090\n    apiKeys:\n      - principal: reader\n        keyEnv: DATAWARK_READER_KEY\ndatasources:\n  - name: analytics\n    driver: postgres\n    dsnEnv: DATAWARK_ANALYTICS_DSN\npolicies:\n  - name: orders\n    principals: [reader]\n    datasource: analytics\n    allow:\n      - table: public.orders\n        operations: [select]\n        columns: [id]\n"
+	cfg, err := Parse([]byte(base))
+	if err != nil || len(cfg.Server.HTTPListener().APIKeys) != 1 || cfg.Server.HTTPListener().APIKeys[0].KeyEnv != "DATAWARK_READER_KEY" {
+		t.Fatalf("Parse() = %#v, %v", cfg.Server.HTTP, err)
+	}
+	for name, replacement := range map[string]string{
+		"empty principal": "principal: reader", "duplicate principal": "keyEnv: DATAWARK_READER_KEY", "duplicate environment": "principal: reader", "inline secret": "keyEnv: DATAWARK_READER_KEY", "unknown field": "keyEnv: DATAWARK_READER_KEY",
+	} {
+		value := base
+		switch name {
+		case "empty principal":
+			value = strings.Replace(value, replacement, "principal: ''", 1)
+		case "duplicate principal":
+			value = strings.Replace(value, replacement, "keyEnv: DATAWARK_READER_KEY\n      - principal: reader\n        keyEnv: DATAWARK_WRITER_KEY", 1)
+		case "duplicate environment":
+			value = strings.Replace(value, replacement, "principal: reader\n        keyEnv: DATAWARK_READER_KEY\n      - principal: writer\n        keyEnv: DATAWARK_READER_KEY", 1)
+		case "inline secret":
+			value = strings.Replace(value, replacement, "keyEnv: DATAWARK_READER_KEY\n        key: very-secret", 1)
+		case "unknown field":
+			value = strings.Replace(value, replacement, "keyEnv: DATAWARK_READER_KEY\n        unexpected: value", 1)
+		}
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(value))
+			if err == nil || strings.Contains(err.Error(), "very-secret") {
+				t.Fatalf("Parse() error = %v", err)
 			}
 		})
 	}

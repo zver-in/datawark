@@ -193,6 +193,7 @@ func cloneConfig(configuration config.Config) config.Config {
 	}
 	if configuration.Server.HTTP != nil {
 		http := *configuration.Server.HTTP
+		http.APIKeys = append([]config.APIKey(nil), configuration.Server.HTTP.APIKeys...)
 		copy.Server.HTTP = &http
 	}
 	return copy

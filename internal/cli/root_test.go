@@ -132,8 +132,9 @@ func TestServeIntegrationBootstrapsBeforeBindingAndShutsDown(t *testing.T) {
 	defer cancel()
 	command := NewRootCommand(Dependencies{
 		Bootstrap: func(context.Context, string) (*runtime.Runtime, config.Config, error) {
-			return mcpRuntime(t), config.Config{Server: config.Server{HTTP: &config.HTTP{ListenAddress: listener.Addr().String()}}}, nil
+			return mcpRuntime(t), config.Config{Server: config.Server{HTTP: &config.HTTP{ListenAddress: listener.Addr().String(), APIKeys: []config.APIKey{{Principal: "local-dev", KeyEnv: "DATAWARK_TEST_API_KEY"}}}}}, nil
 		},
+		Lookup: func(name string) (string, bool) { return "test-key", name == "DATAWARK_TEST_API_KEY" },
 		Listen: func(string, string) (net.Listener, error) { return listener, nil },
 	})
 	command.SetContext(ctx)
