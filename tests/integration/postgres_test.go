@@ -146,6 +146,61 @@ func TestMCPQueryUsesSharedRuntimePipeline(t *testing.T) {
 	}
 }
 
+func TestMCPHTTPUsesSharedRuntimePipeline(t *testing.T) {
+	dsn := os.Getenv("DATAWARK_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DATAWARK_TEST_POSTGRES_DSN must be set for integration tests")
+	}
+	connection, err := pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	for _, statement := range []string{"CREATE TABLE IF NOT EXISTS public.mcp_http_fixture (id integer PRIMARY KEY, secret text)", "TRUNCATE public.mcp_http_fixture", "INSERT INTO public.mcp_http_fixture VALUES (1, 'hidden')"} {
+		if _, err := connection.Exec(context.Background(), statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configuration := config.Config{Version: config.VersionV1Alpha1, Server: config.Server{DevelopmentPrincipal: "reader", HTTP: &config.HTTP{ListenAddress: "127.0.0.1:8080", APIKeys: []config.APIKey{{Principal: "reader", KeyEnv: "MCP_HTTP_READER"}}}}, Datasources: []config.Datasource{{Name: "test_postgres", Driver: "postgres", DSNEnv: "DATAWARK_TEST_POSTGRES_DSN"}}, Policies: []config.Policy{{Name: "mcp-http-read", Principals: []string{"reader"}, Datasource: "test_postgres", Allow: []config.AllowEntry{{Table: "public.mcp_http_fixture", Operations: []string{"select"}, Columns: []string{"id"}}}}}}
+	runtime, err := gatewayruntime.NewFromConfig(context.Background(), configuration, gatewayruntime.Dependencies{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := httpserver.NewAuthenticator(configuration.Server.HTTP.APIKeys, func(string) (string, bool) { return "reader-key", true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(httpserver.NewWithGateway("", auth, func(identity principal.Trusted) (httpserver.Gateway, error) { return runtime.Bind(identity) }).Handler())
+	defer server.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "integration", Version: "v1"}, nil)
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: server.URL + "/mcp", HTTPClient: &http.Client{Transport: bearerRoundTripper("reader-key")}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	for name, arguments := range map[string]any{
+		"list_allowed_schema": map[string]any{},
+		"query_data":          map[string]any{"source": "test_postgres", "table": "public.mcp_http_fixture", "projection": []string{"id"}, "limit": 1},
+	} {
+		result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: arguments})
+		if err != nil || result.IsError || len(result.Content) != 1 {
+			t.Fatalf("MCP HTTP %s result=%#v err=%v", name, result, err)
+		}
+		text := result.Content[0].(*mcp.TextContent).Text
+		if strings.Contains(text, "hidden") {
+			t.Fatalf("MCP HTTP leaked hidden data: %s", text)
+		}
+	}
+}
+
+type bearerRoundTripper string
+
+func (key bearerRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	request = request.Clone(request.Context())
+	request.Header.Set("Authorization", "Bearer "+string(key))
+	return http.DefaultTransport.RoundTrip(request)
+}
+
 // TestRESTDataAPIExercises the HTTP adapter against the same Docker PostgreSQL
 // runtime used by MCP. It covers allowed, denied, explain, schema filtering,
 // authenticated principal isolation, and fail-closed audit handoff.

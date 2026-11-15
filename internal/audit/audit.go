@@ -78,7 +78,7 @@ func (event Event) Validate() error {
 	if !validTransport(event.Transport) || !validOperation(event.Operation) || !validOutcome(event.Outcome) || !validReason(event.Reason) {
 		return errors.New("audit event is invalid")
 	}
-	if event.Operation == OperationAuthenticate && event.Transport != TransportREST {
+	if event.Operation == OperationAuthenticate && event.Transport != TransportREST && event.Transport != TransportMCPHTTP {
 		return errors.New("audit event is invalid")
 	}
 	if event.Outcome == OutcomeSuccess && event.Reason != ReasonNone {

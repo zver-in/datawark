@@ -111,7 +111,7 @@ func (authenticator *Authenticator) middleware(next http.Handler) http.Handler {
 		}
 		started := time.Now()
 		identity, ok := authenticator.Authenticate(request.Header)
-		event := audit.Event{Version: audit.VersionV1Alpha1, Timestamp: started.UTC(), RequestID: RequestID(request.Context()), Transport: audit.TransportREST, Operation: audit.OperationAuthenticate, DurationMS: time.Since(started).Milliseconds()}
+		event := audit.Event{Version: audit.VersionV1Alpha1, Timestamp: started.UTC(), RequestID: RequestID(request.Context()), Transport: authenticationTransport(request.URL.Path), Operation: audit.OperationAuthenticate, DurationMS: time.Since(started).Milliseconds()}
 		if !ok {
 			event.Outcome, event.Reason = audit.OutcomeDenied, audit.ReasonAuthentication
 			if !authenticator.record(event) {
@@ -128,6 +128,13 @@ func (authenticator *Authenticator) middleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(writer, request.WithContext(context.WithValue(request.Context(), principalContextKey{}, identity)))
 	})
+}
+
+func authenticationTransport(path string) audit.Transport {
+	if path == "/mcp" {
+		return audit.TransportMCPHTTP
+	}
+	return audit.TransportREST
 }
 
 func (authenticator *Authenticator) record(event audit.Event) bool {

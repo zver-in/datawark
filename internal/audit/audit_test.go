@@ -18,12 +18,11 @@ func event() Event {
 
 func TestEventValidation(t *testing.T) {
 	for name, mutate := range map[string]func(*Event){
-		"version":                  func(e *Event) { e.Version = "v1" },
-		"transport":                func(e *Event) { e.Transport = "stdio" },
-		"operation":                func(e *Event) { e.Operation = "sql" },
-		"success reason":           func(e *Event) { e.Reason = ReasonPolicy },
-		"failure reason":           func(e *Event) { e.Outcome = OutcomeDenied },
-		"authentication transport": func(e *Event) { e.Transport = TransportMCPHTTP },
+		"version":        func(e *Event) { e.Version = "v1" },
+		"transport":      func(e *Event) { e.Transport = "stdio" },
+		"operation":      func(e *Event) { e.Operation = "sql" },
+		"success reason": func(e *Event) { e.Reason = ReasonPolicy },
+		"failure reason": func(e *Event) { e.Outcome = OutcomeDenied },
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := event()

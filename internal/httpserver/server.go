@@ -5,13 +5,16 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
 
 	"datawark/internal/audit"
+	"datawark/internal/mcpserver"
 	"github.com/go-chi/chi/v5"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 const (
@@ -57,6 +60,7 @@ func newServer(address string, bind GatewayBinder, recorder audit.Recorder, auth
 	router.Get("/api/v1/ready", service.readiness)
 	if bind != nil {
 		newRESTAPI(bind, recorder).routes(router)
+		router.Handle("/mcp", mcpHTTPHandler(bind, recorder))
 	}
 	var handler http.Handler = router
 	if len(authenticators) == 1 && authenticators[0] != nil {
@@ -73,6 +77,37 @@ func newServer(address string, bind GatewayBinder, recorder audit.Recorder, auth
 	}
 	return service
 }
+
+func mcpHTTPHandler(bind GatewayBinder, recorder audit.Recorder) http.Handler {
+	logger := slog.New(safeMCPLogHandler{base: slog.Default().Handler()})
+	return mcp.NewStreamableHTTPHandler(func(request *http.Request) *mcp.Server {
+		identity, ok := Principal(request.Context())
+		if !ok || bind == nil {
+			return nil
+		}
+		gateway, err := bind(identity)
+		if err != nil || gateway == nil {
+			return nil
+		}
+		return mcpserver.New(mcpserver.NewAuditedGateway(gateway, recorder, RequestID(request.Context()), identity.Name()))
+	}, &mcp.StreamableHTTPOptions{Stateless: true, Logger: logger})
+}
+
+// safeMCPLogHandler preserves the existence and severity of SDK diagnostics
+// without allowing protocol-derived messages or attributes into operational
+// logs. MCP responses never use this logger.
+type safeMCPLogHandler struct{ base slog.Handler }
+
+func (handler safeMCPLogHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return handler.base.Enabled(ctx, level)
+}
+
+func (handler safeMCPLogHandler) Handle(ctx context.Context, record slog.Record) error {
+	return handler.base.Handle(ctx, slog.NewRecord(record.Time, record.Level, "mcp streamable HTTP diagnostic", record.PC))
+}
+
+func (handler safeMCPLogHandler) WithAttrs([]slog.Attr) slog.Handler { return handler }
+func (handler safeMCPLogHandler) WithGroup(string) slog.Handler      { return handler }
 
 func (service *Server) Handler() http.Handler { return service.server.Handler }
 
