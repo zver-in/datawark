@@ -27,7 +27,7 @@ DataWark Assistant (Web + Backend) ─ REST ──┘
 - Интерфейсы: CLI, MCP stdio, MCP Streamable HTTP, REST API.
 - В MVP: PostgreSQL и операции чтения через ограниченный Structured Query Plan.
 - Единый механизм policy enforcement для всех интерфейсов.
-- В начальной версии запросы исполняются от единственного principal, заданного конфигурацией сервера; аутентификация отложена.
+- MCP stdio uses a server-configured local principal; network REST and MCP authenticate API-key identities.
 
 ### DataWark Assistant
 
@@ -42,9 +42,9 @@ DataWark Assistant (Web + Backend) ─ REST ──┘
 | Режим | Команда | Назначение | Состояние |
 |---|---|---|---|
 | CLI | `datawark config validate`, `datawark source test` | Локальная конфигурация и диагностика | Реализовано |
-| CLI explain | `datawark policy explain` | Локальный административный dry-run; не блокирует HTTP milestone | Запланировано |
+| CLI explain | `datawark policy explain` | Локальный административный dry-run | Реализовано |
 | MCP stdio | `datawark mcp stdio` | Локальные MCP-клиенты; без сетевого listener | Реализовано |
-| HTTP Server | `datawark serve` | REST API и MCP Streamable HTTP на одном listener | Запланировано |
+| HTTP Server | `datawark serve` | REST API и MCP Streamable HTTP на одном listener | Реализовано |
 
 Административные CLI-команды доступны только доверенному локальному оператору. Удалённый административный API не входит в MVP.
 
@@ -193,10 +193,10 @@ datawark/
 - Каждый policy содержит уникальное `name`, непустые `principals`, `datasource` и `allow`. `allow` содержит `table`, `operations: [select]` и разрешённые `columns`.
 - YAML-парсер отклоняет неизвестные поля, повторяющиеся имена, пустые обязательные значения и неподдерживаемые операции/драйверы.
 - Для допуска запроса один элемент `allow` обязан целиком покрыть источник, таблицу и все колонки из `projection`, `filters` и `order`; разрешения из разных элементов не объединяются.
-- DSN передаётся через переменные окружения / secrets, не хранится в Git. API keys будут добавлены вместе с HTTP-аутентификацией.
+- DSN и API keys передаются через переменные окружения / secrets, не хранятся в Git.
 - Gateway не использует отдельную metadata database: конфигурация и политики загружаются из YAML, а schema snapshots находятся в памяти процесса.
 - Политики загружаются при запуске; некорректная конфигурация блокирует старт. Изменение требует перезапуска; hot reload отсутствует.
-- Docker Compose: Gateway + тестовый PostgreSQL; отдельный пример полного стека с Assistant.
+- Docker Compose: loopback-only Gateway + PostgreSQL demo with a least-privilege reader role. Assistant is not shipped.
 
 ## 13. Стратегия тестирования и CI
 
@@ -210,7 +210,7 @@ datawark/
 - Unit-тесты обязательны для новой ветви логики; отрицательные проверки policy и компилятора добавляются рядом с позитивными.
 - Интеграционные тесты не используют внешние БД и не принимают production credentials. Они получают DSN только через `DATAWARK_TEST_POSTGRES_DSN`, который задаёт тестовая команда.
 - Fuzz/property tests для парсера, Query Plan и SQL Compiler выполняются отдельно локально и добавляются в CI по мере появления корпусов.
-- Pull request и изменения в `main` запускают GitHub Actions: проверку форматирования (`gofmt`), `go vet`, unit-тесты с race detector и интеграционные тесты с Docker Compose. Интеграционная job всегда очищает Docker volume после завершения.
+- Pull request и изменения в `main` запускают один GitHub Actions workflow: format/vet, race unit tests, PostgreSQL integration tests и `make verify-public-mvp`.
 
 ## 14. Порядок реализации
 
@@ -218,8 +218,8 @@ datawark/
 2. **M1 — Security Core:** Policy Engine, Query Plan, Validator, SQL Compiler, unit/fuzz tests.
 3. **M2 — PostgreSQL:** introspection, executor, ограничения, интеграционные тесты.
 4. **M3 — MCP stdio:** локальное использование AI-клиентами.
-5. **M4 — HTTP Gateway:** REST, MCP Streamable HTTP, API keys, JSON-аудит и базовая observability; CLI `policy explain` развивается параллельно и не блокирует HTTP.
-6. **M5 — Public MVP:** Docker Compose, quickstart, security regression tests.
+5. **M4 — HTTP Gateway (complete):** REST, MCP Streamable HTTP, API keys, JSON-аудит, observability и CLI `policy explain`.
+6. **M5 — Public Gateway release:** Docker Compose, quickstart, threat model, security regressions and release gate.
 7. **M6 — AI Database Assistant:** Web UI + Go backend + LLM; только после Public Gateway MVP и только через публичный Gateway API.
 8. **После M6 — Advanced governance:** OIDC, row-level policies, masking и дополнительные СУБД.
 

@@ -1,0 +1,28 @@
+version: v1alpha1
+
+server:
+  developmentPrincipal: demo-reader
+  http:
+    listenAddress: 0.0.0.0:8080
+    apiKeys:
+      - principal: demo-reader
+        keyEnv: DATAWARK_LOCAL_API_KEY
+  runtime:
+    statementTimeout: 5s
+    maxRows: 100
+    maxResultBytes: 1048576
+    maxConcurrentQueries: 8
+
+datasources:
+  - name: analytics
+    driver: postgres
+    dsnEnv: DATAWARK_ANALYTICS_DSN
+
+policies:
+  - name: demo-orders-read
+    principals: [demo-reader]
+    datasource: analytics
+    allow:
+      - table: sales.orders
+        operations: [select]
+        columns: [id, status, total, created_at]
