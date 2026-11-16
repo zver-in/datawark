@@ -177,7 +177,6 @@ datawark/
 ├── api/openapi.yaml
 ├── configs/examples/
 ├── tests/{integration,security}/
-├── docs/adr/
 ├── Dockerfile
 └── compose.yaml
 ```
