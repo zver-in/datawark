@@ -13,9 +13,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -38,6 +40,179 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/spf13/cobra"
 )
+
+func TestServeProcessHelper(t *testing.T) {
+	if os.Getenv("DATAWARK_INTEGRATION_SERVE_HELPER") != "1" {
+		return
+	}
+	for index, argument := range os.Args {
+		if argument == "--" {
+			os.Exit(cli.Execute(os.Args[index+1:], os.Stdout, os.Stderr))
+		}
+	}
+	os.Exit(2)
+}
+
+func TestServeProcessOwnsDockerRESTMCPMetricsAndStreams(t *testing.T) {
+	dsn := os.Getenv("DATAWARK_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Fatal("DATAWARK_TEST_POSTGRES_DSN must be set for integration tests")
+	}
+	connection, err := pgx.Connect(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close(context.Background())
+	for _, statement := range []string{"CREATE TABLE IF NOT EXISTS public.process_fixture (id integer PRIMARY KEY, secret text)", "TRUNCATE public.process_fixture", "INSERT INTO public.process_fixture VALUES (1, 'process-fixture-secret-9841')"} {
+		if _, err := connection.Exec(context.Background(), statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	_ = listener.Close()
+	configPath := filepath.Join(t.TempDir(), "gateway.yaml")
+	apiKey := "process-api-key-9841"
+	configuration := "version: v1alpha1\nserver:\n  developmentPrincipal: process-reader\n  http:\n    listenAddress: " + address + "\n    apiKeys:\n      - principal: process-reader\n        keyEnv: DATAWARK_PROCESS_KEY\ndatasources:\n  - name: process_source_9841\n    driver: postgres\n    dsnEnv: DATAWARK_TEST_POSTGRES_DSN\npolicies:\n  - name: process-read\n    principals: [process-reader]\n    datasource: process_source_9841\n    allow:\n      - table: public.process_fixture\n        operations: [select]\n        columns: [id]\n"
+	if err := os.WriteFile(configPath, []byte(configuration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=TestServeProcessHelper", "--", "serve", "--config", configPath)
+	command.Env = append(os.Environ(), "DATAWARK_INTEGRATION_SERVE_HELPER=1", "DATAWARK_PROCESS_KEY="+apiKey)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := command.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := false
+	t.Cleanup(func() {
+		if !done && command.Process != nil {
+			_ = command.Process.Kill()
+			_, _ = io.Copy(io.Discard, stdout)
+			_, _ = io.Copy(io.Discard, stderr)
+			_ = command.Wait()
+		}
+	})
+	stdoutDone, stderrDone := make(chan []byte, 1), make(chan []byte, 1)
+	go func() { data, _ := io.ReadAll(stdout); stdoutDone <- data }()
+	go func() { data, _ := io.ReadAll(stderr); stderrDone <- data }()
+	endpoint := "http://" + address
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		response, requestErr := http.Get(endpoint + "/api/v1/ready")
+		if requestErr == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("serve readiness: %v", requestErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	request, _ := http.NewRequest(http.MethodPost, endpoint+"/api/v1/query", strings.NewReader(`{"source":"process_source_9841","table":"public.process_fixture","projection":["id"],"filters":[],"order":[],"limit":1}`))
+	request.Header.Set("Authorization", "Bearer "+apiKey)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(httpserver.RequestIDHeader, "process-request-9841")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("REST status=%d", response.StatusCode)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "process-test", Version: "v1"}, nil)
+	session, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: endpoint + "/mcp", HTTPClient: &http.Client{Transport: bearerRoundTripper(apiKey)}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "query_data", Arguments: map[string]any{"source": "process_source_9841", "table": "public.process_fixture", "projection": []string{"id"}, "limit": 1}})
+	_ = session.Close()
+	if err != nil || result.IsError {
+		t.Fatalf("MCP result=%#v err=%v", result, err)
+	}
+	response, err = http.Get(endpoint + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	assertProcessMetricEvidence(t, metrics, []string{`value:"rest"`, `value:"mcp_http"`, `value:"query"`, `value:"authenticated"`})
+	for _, secret := range []string{apiKey, "process-reader", "process-request-9841", "process_source_9841", "process_fixture", "process-fixture-secret-9841", dsn, configuration} {
+		if strings.Contains(string(metrics), secret) {
+			t.Fatalf("metrics leaked %q", secret)
+		}
+	}
+	if err := command.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	done = true
+	actualStdout, actualStderr := <-stdoutDone, <-stderrDone
+	assertProcessAuditAndOperationalStreams(t, actualStdout, actualStderr)
+}
+
+func assertProcessMetricEvidence(t *testing.T, data []byte, expected []string) {
+	t.Helper()
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"datawark_gateway_requests_total", "datawark_gateway_request_duration_seconds"} {
+		family := families[name]
+		if family == nil {
+			t.Fatalf("missing %s", name)
+		}
+		text := family.String()
+		for _, value := range expected {
+			if !strings.Contains(text, value) {
+				t.Fatalf("%s missing %s: %s", name, value, text)
+			}
+		}
+	}
+}
+
+func assertProcessAuditAndOperationalStreams(t *testing.T, stdout, stderr []byte) {
+	t.Helper()
+	audits := 0
+	for _, line := range strings.FieldsFunc(string(stdout), func(r rune) bool { return r == '\n' }) {
+		var event audit.Event
+		if json.Unmarshal([]byte(line), &event) != nil || event.Validate() != nil {
+			t.Fatalf("invalid audit stdout %q", line)
+		}
+		audits++
+	}
+	if audits < 4 {
+		t.Fatalf("audit stdout=%s", stdout)
+	}
+	lifecycle := []string{}
+	for _, line := range strings.FieldsFunc(string(stderr), func(r rune) bool { return r == '\n' }) {
+		var record map[string]any
+		if json.Unmarshal([]byte(line), &record) != nil || record["msg"] == nil {
+			t.Fatalf("invalid operational stderr %q", line)
+		}
+		if event, ok := record["event"].(string); ok {
+			lifecycle = append(lifecycle, event)
+		}
+	}
+	if strings.Join(lifecycle, ",") != "startup,readiness_withdrawn,shutdown" || !strings.Contains(string(stderr), "http request complete") || strings.Contains(string(stderr), `"version":"v1alpha1"`) {
+		t.Fatalf("stderr=%s", stderr)
+	}
+}
 
 func TestPostgreSQLIsReachable(t *testing.T) {
 	dsn := os.Getenv("DATAWARK_TEST_POSTGRES_DSN")

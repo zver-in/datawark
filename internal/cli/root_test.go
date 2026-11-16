@@ -16,7 +16,9 @@ import (
 	"testing"
 	"time"
 
+	"datawark/internal/audit"
 	"datawark/internal/config"
+	"datawark/internal/httpserver"
 	"datawark/internal/policy"
 	"datawark/internal/runtime"
 	"datawark/internal/schema"
@@ -222,6 +224,113 @@ func TestServeWritesAuditEventsOnlyToStdout(t *testing.T) {
 	}
 }
 
+// TestServeProcessStreamsKeepAuditAndOperationalRecordsSeparated exercises the
+// command boundary: Cobra's stdout becomes the audit sink and the process
+// stderr remains the operational logger sink.
+func TestServeProcessStreamsKeepAuditAndOperationalRecordsSeparated(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=TestMCPStdioProcessHelper", "--")
+	command.Env = append(os.Environ(), "DATAWARK_SERVE_PROCESS_HELPER=1", "DATAWARK_SERVE_ADDRESS="+address, "DATAWARK_SERVE_CONFIG_SECRET=cli-config-secret-9841", "DATAWARK_SERVE_CREDENTIAL_SECRET=cli-credential-secret-9841")
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr, err := command.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	finished := false
+	t.Cleanup(func() {
+		if !finished && command.Process != nil {
+			_ = command.Process.Kill()
+			_, _ = io.Copy(io.Discard, stdout)
+			_, _ = io.Copy(io.Discard, stderr)
+			_ = command.Wait()
+		}
+	})
+	stdoutDone := make(chan []byte, 1)
+	stderrDone := make(chan []byte, 1)
+	go func() { data, _ := io.ReadAll(stdout); stdoutDone <- data }()
+	go func() { data, _ := io.ReadAll(stderr); stderrDone <- data }()
+	endpoint := "http://" + address
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		response, requestErr := http.Get(endpoint + "/api/v1/ready")
+		if requestErr == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("serve helper did not become ready: %v", requestErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	request, err := http.NewRequest(http.MethodPost, endpoint+"/api/v1/query?hostile=cli-request-secret-9841", strings.NewReader(`{"source":"analytics","table":"public.hostile_cli_secret_9841","projection":["id"],"limit":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer cli-credential-secret-9841")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(httpserver.RequestIDHeader, "cli-request-id-9841")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("query status = %d", response.StatusCode)
+	}
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	finished = true
+	actualStdout, actualStderr := <-stdoutDone, <-stderrDone
+	var audits []audit.Event
+	for _, line := range strings.FieldsFunc(string(actualStdout), func(r rune) bool { return r == '\n' }) {
+		var event audit.Event
+		if err := json.Unmarshal([]byte(line), &event); err != nil || event.Validate() != nil {
+			t.Fatalf("stdout is not a complete audit event: %q (%v)", line, err)
+		}
+		audits = append(audits, event)
+	}
+	if len(audits) < 2 || audits[0].Operation != audit.OperationAuthenticate || audits[1].Operation != audit.OperationQuery {
+		t.Fatalf("audit events = %#v", audits)
+	}
+	var lifecycle []string
+	for _, line := range strings.FieldsFunc(string(actualStderr), func(r rune) bool { return r == '\n' }) {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil || record["time"] == nil || record["msg"] == nil {
+			t.Fatalf("stderr is not operational JSON: %q (%v)", line, err)
+		}
+		if event, ok := record["event"].(string); ok {
+			lifecycle = append(lifecycle, event)
+		}
+	}
+	if strings.Join(lifecycle, ",") != "startup,readiness_withdrawn,shutdown" || !strings.Contains(string(actualStderr), "http request complete") {
+		t.Fatalf("operational lifecycle = %v stderr=%s", lifecycle, actualStderr)
+	}
+	for _, secret := range []string{"cli-config-secret-9841", "cli-credential-secret-9841", "cli-request-secret-9841", "hostile_cli_secret_9841"} {
+		if strings.Contains(string(actualStdout), secret) || strings.Contains(string(actualStderr), secret) {
+			t.Fatalf("process stream leaked %q", secret)
+		}
+	}
+}
+
 type mcpCatalog struct{}
 
 func (mcpCatalog) Load(context.Context, config.Config, string) (schema.Snapshot, error) {
@@ -256,6 +365,18 @@ func TestMCPStdioProcessKeepsDiagnosticsOffStdout(t *testing.T) {
 }
 
 func TestMCPStdioProcessHelper(t *testing.T) {
+	if os.Getenv("DATAWARK_SERVE_PROCESS_HELPER") == "1" {
+		address := os.Getenv("DATAWARK_SERVE_ADDRESS")
+		command := NewRootCommand(Dependencies{
+			Bootstrap: func(context.Context, string) (*runtime.Runtime, config.Config, error) {
+				return mcpRuntime(t), config.Config{Server: config.Server{HTTP: &config.HTTP{ListenAddress: address, APIKeys: []config.APIKey{{Principal: "local-dev", KeyEnv: "DATAWARK_SERVE_CREDENTIAL_SECRET"}}}}}, nil
+			},
+		})
+		command.SetOut(os.Stdout)
+		command.SetErr(os.Stderr)
+		command.SetArgs([]string{"serve", "--config", "cli-config-secret-9841"})
+		os.Exit(boolExit(command.Execute()))
+	}
 	if os.Getenv("DATAWARK_MCP_PROTOCOL_HELPER") == "1" {
 		command := NewRootCommand(Dependencies{Runtime: func(context.Context, string) (*runtime.Runtime, error) { return mcpRuntime(t), nil }})
 		command.SetArgs([]string{"mcp", "stdio", "--config", "gateway.yaml"})

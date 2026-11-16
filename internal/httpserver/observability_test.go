@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -115,6 +116,93 @@ func TestObservabilityCollapsesHostileValuesIntoBoundedMetricSeries(t *testing.T
 		t.Fatalf("request series = %d, want one collapsed unknown-traffic series", requests)
 	}
 	assertOwnedMetricLabels(t, response.Body.Bytes())
+}
+
+func TestMetricsRetainLabelSetsAcrossHostileHTTPMatrix(t *testing.T) {
+	keys := []config.APIKey{{Principal: "reader-9841", KeyEnv: "KEY_A"}, {Principal: "writer-9841", KeyEnv: "KEY_B"}}
+	authenticator, err := NewAuthenticator(keys, func(name string) (string, bool) {
+		return map[string]string{"KEY_A": "key-a-9841", "KEY_B": "key-b-9841"}[name], true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewWithGateway("", authenticator, func(principal.Trusted) (Gateway, error) {
+		return &restGateway{executeResult: execution.Result{Columns: []string{"id"}}}, nil
+	})
+	call := func(index int) {
+		token := fmt.Sprintf("hostile-value-%03d-9841", index)
+		path := "/api/v1/query"
+		if index%3 == 2 {
+			path = "/untrusted/" + token
+		}
+		body := fmt.Sprintf(`{"source":"source-%s","table":"public.table_%s","projection":["column_%s"],"filters":[{"column":"column_%s","operator":"eq","value":"%s"}],"limit":1}`, token, token, token, token, token)
+		request := httptest.NewRequest(http.MethodPost, path+"?query="+token+"&status="+token, strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+map[bool]string{true: "key-a-9841", false: "unknown-" + token}[index%2 == 0])
+		request.Header.Set(RequestIDHeader, "request-"+token)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Untrusted-Header", token)
+		service.Handler().ServeHTTP(httptest.NewRecorder(), request)
+	}
+	// Prime each bounded outcome before taking the baseline, then repeat it with
+	// distinctive values that must never become metric labels.
+	for i := range 6 {
+		call(i)
+	}
+	// The first scrape itself creates the bounded operational metrics series.
+	_, _ = ownedMetricLabelSets(t, service)
+	baseline, raw := ownedMetricLabelSets(t, service)
+	for i := range 100 {
+		call(i + 10)
+	}
+	after, afterRaw := ownedMetricLabelSets(t, service)
+	if !equalLabelSets(baseline, after) {
+		t.Fatalf("owned metric label sets changed\nbefore=%v\nafter=%v", baseline, after)
+	}
+	for _, value := range []string{"hostile-value-010-9841", "source-hostile", "table_hostile", "column_hostile", "request-hostile", "key-a-9841"} {
+		if strings.Contains(raw+afterRaw, value) {
+			t.Fatalf("metrics leaked submitted value %q", value)
+		}
+	}
+}
+
+func ownedMetricLabelSets(t *testing.T, service *Server) (map[string]map[string]bool, string) {
+	t.Helper()
+	response := httptest.NewRecorder()
+	service.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	data := response.Body.Bytes()
+	assertOwnedMetricLabels(t, data)
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sets := map[string]map[string]bool{}
+	for _, name := range []string{"datawark_gateway_requests_total", "datawark_gateway_request_duration_seconds"} {
+		sets[name] = map[string]bool{}
+		for _, metric := range families[name].Metric {
+			labels := make([]string, 0, len(metric.Label))
+			for _, label := range metric.Label {
+				labels = append(labels, label.GetName()+"="+label.GetValue())
+			}
+			sort.Strings(labels)
+			sets[name][strings.Join(labels, ",")] = true
+		}
+	}
+	return sets, string(data)
+}
+
+func equalLabelSets(left, right map[string]map[string]bool) bool {
+	for name, values := range left {
+		if len(values) != len(right[name]) {
+			return false
+		}
+		for value := range values {
+			if !right[name][value] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func TestHTTPMetricsCoverBoundedOutcomeCategories(t *testing.T) {
